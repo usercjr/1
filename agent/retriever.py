@@ -35,6 +35,10 @@ log = logging.getLogger(__name__)
 # 与 02_build_index.py 保持一致
 _NON_TOKEN = re.compile(r"[^一-龥A-Za-z0-9%·年月日条款章节项]+")
 
+# 条款号正则（中文/阿拉伯数字）
+_RE_CLAUSE = re.compile(r"第[一二三四五六七八九十百千零0-9]+条")
+_CLAUSE_BOOST = 2.5     # query 含条款号时，含此条款号的 chunk 分数 ×
+
 # 从 build_index 同步过来的金融词（如果 jieba 已被 init 过，加重复也无害）
 _FINANCE_TERMS = [
     "保险责任", "身故保险金", "现金价值", "退保金额", "账户价值", "保单贷款", "犹豫期",
@@ -117,12 +121,22 @@ class Retriever:
         doc_ids: Optional[Iterable[str]],
         top_k: int,
         oversample: int = 10,
+        clause_hits: Optional[set] = None,
     ) -> List[Hit]:
         idx = self._load(domain)
         chunks: List[Dict[str, Any]] = idx["chunks"]
         bm25 = idx["bm25"]
 
         scores = bm25.get_scores(list(query_tokens))
+
+        # 条款号 boost：query 里命中"第 X 条"时，含相同 section 的 chunk 分数 × _CLAUSE_BOOST
+        if clause_hits:
+            import numpy as _np
+            scores = scores.copy() if hasattr(scores, "copy") else list(scores)
+            for i, c in enumerate(chunks):
+                sec = c.get("section") or ""
+                if sec and any(ch in sec for ch in clause_hits):
+                    scores[i] *= _CLAUSE_BOOST
 
         # doc_ids 过滤（A 榜 oracle）
         doc_filter = None
@@ -196,14 +210,16 @@ class Retriever:
         toks = tokenize(query)
         if not toks:
             return []
+        # 抽 query 里的条款号，传给单域检索做 boost
+        clause_hits = set(_RE_CLAUSE.findall(query))
         if domain:
-            hits = self._search_one(domain, toks, doc_ids, top_k)
+            hits = self._search_one(domain, toks, doc_ids, top_k, clause_hits=clause_hits)
         else:
-            # 全域召回：每域取 top_k，再按 score 合并
             all_hits: List[Hit] = []
             for d in self.DOMAINS:
                 try:
-                    all_hits.extend(self._search_one(d, toks, doc_ids, top_k))
+                    all_hits.extend(self._search_one(
+                        d, toks, doc_ids, top_k, clause_hits=clause_hits))
                 except FileNotFoundError:
                     continue
             all_hits.sort(key=lambda h: -h.score)

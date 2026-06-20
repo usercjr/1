@@ -33,14 +33,18 @@ def _get(name: str, default: str | None = None, required: bool = False) -> str |
 
 # ---- 公开配置 ----
 DASHSCOPE_API_KEY: str = _get("DASHSCOPE_API_KEY", required=True)  # type: ignore[assignment]
-DASHSCOPE_BASE_URL: str | None = _get("DASHSCOPE_BASE_URL")
+# OpenAI 兼容模式端点（支持 qwen3.7-plus 等新模型）
+DASHSCOPE_BASE_URL: str = _get(
+    "DASHSCOPE_BASE_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+) or "https://dashscope.aliyuncs.com/compatible-mode/v1"
 QWEN_MODEL: str = _get("QWEN_MODEL", "qwen-plus") or "qwen-plus"
 QWEN_MODEL_TF: str = _get("QWEN_MODEL_TF", QWEN_MODEL) or QWEN_MODEL  # 判断题可分流到更便宜的模型
 
 # 检索 / Prompt 超参（这里集中放，方便实验）
 TOP_K_CHUNKS: int = int(_get("TOP_K_CHUNKS", "5") or 5)
 MAX_CHUNK_CHARS_IN_PROMPT: int = int(_get("MAX_CHUNK_CHARS", "700") or 700)
-MAX_COMPLETION_TOKENS: int = int(_get("MAX_COMPLETION_TOKENS", "8") or 8)
+MAX_COMPLETION_TOKENS: int = int(_get("MAX_COMPLETION_TOKENS", "400") or 400)  # v3: JSON CoT 需要更多
 TEMPERATURE: float = float(_get("TEMPERATURE", "0.0") or 0.0)
 
 # Token 预算（用于警告）

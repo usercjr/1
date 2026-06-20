@@ -2,31 +2,32 @@
 """
 agent/llm.py
 ============
-Qwen (DashScope) 调用封装。要点：
-  - 单例 token 统计（prompt / completion / total / calls）
-  - 失败指数退避重试（针对 429 / 5xx / 超时）
-  - 强制低温度、低 max_tokens，避免无意义生成
-  - 调用日志可选写入文件（按需开启，方便事后审计）
+Qwen (DashScope) 调用封装 —— 通过 OpenAI 兼容模式 + OpenAI SDK
+端点: https://dashscope.aliyuncs.com/compatible-mode/v1
 
-用法：
-    from agent.llm import QwenLLM, get_token_stats
-    llm = QwenLLM()                # 用 config.QWEN_MODEL 默认 qwen-plus
-    ans = llm.chat("...")          # 同步返回字符串
-    stats = get_token_stats().to_dict()
+支持模型：
+  - qwen-plus, qwen-max, qwen-turbo（老命名，alias）
+  - qwen3.7-plus, qwen3.7-max, qwen3-vl-* 等新命名
+  - 任何 dashscope 在兼容端点上线的模型
+
+要点：
+  - 单例 token 统计（prompt / completion / total / calls / by_model）
+  - 失败指数退避重试（429 / 5xx / 超时）
+  - 强制低温度、低 max_tokens，输出尽量收敛
+  - 调用日志可选写入 jsonl（按需开启）
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import dashscope
-from dashscope import Generation
+from openai import OpenAI
+from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 from agent import config
 
@@ -47,10 +48,13 @@ class TokenStats:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def add(self, model: str, usage: Any):
-        """usage 可以是 dict 或 dashscope 返回的 usage 对象。"""
-        p = int(getattr(usage, "input_tokens", None) or usage.get("input_tokens", 0))
-        c = int(getattr(usage, "output_tokens", None) or usage.get("output_tokens", 0))
-        t = int(getattr(usage, "total_tokens", None) or usage.get("total_tokens", p + c))
+        """usage 可以是 dict 或 OpenAI SDK 的 CompletionUsage 对象。"""
+        p = int(getattr(usage, "prompt_tokens", None) or
+                (usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0))
+        c = int(getattr(usage, "completion_tokens", None) or
+                (usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0))
+        t = int(getattr(usage, "total_tokens", None) or
+                (usage.get("total_tokens", p + c) if isinstance(usage, dict) else (p + c)))
         with self._lock:
             self.prompt_tokens += p
             self.completion_tokens += c
@@ -89,14 +93,33 @@ def get_token_stats() -> TokenStats:
 
 
 # ===========================================================================
-# Qwen 客户端
+# Qwen 客户端（OpenAI 兼容模式）
 # ===========================================================================
 class QwenError(RuntimeError):
     pass
 
 
+# 全局共享 client（连接池复用）
+_CLIENT: Optional[OpenAI] = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _get_client(timeout: int = 60) -> OpenAI:
+    global _CLIENT
+    if _CLIENT is None:
+        with _CLIENT_LOCK:
+            if _CLIENT is None:
+                _CLIENT = OpenAI(
+                    api_key=config.DASHSCOPE_API_KEY,
+                    base_url=config.DASHSCOPE_BASE_URL,
+                    timeout=timeout,
+                    max_retries=0,   # 自己控制重试
+                )
+    return _CLIENT
+
+
 class QwenLLM:
-    """轻量同步客户端，按 messages 协议调 DashScope Generation。"""
+    """轻量同步客户端，messages 协议调 DashScope 兼容端点。"""
 
     def __init__(
         self,
@@ -109,10 +132,7 @@ class QwenLLM:
         self.max_retries = max_retries
         self.timeout = timeout
         self.log_path = Path(log_path) if log_path else None
-
-        dashscope.api_key = config.DASHSCOPE_API_KEY
-        if config.DASHSCOPE_BASE_URL:
-            dashscope.base_http_api_url = config.DASHSCOPE_BASE_URL
+        self.client = _get_client(timeout=timeout)
 
     # ---- 主调用 ----
     def chat(
@@ -132,38 +152,39 @@ class QwenLLM:
         last_err: Optional[str] = None
         for attempt in range(self.max_retries):
             try:
-                resp = Generation.call(
+                resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    result_format="message",
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    top_p=0.1,                # 进一步收敛输出
+                    top_p=0.1,
                     timeout=self.timeout,
                 )
-                if getattr(resp, "status_code", 200) != 200:
-                    last_err = f"{getattr(resp, 'code', '')} {getattr(resp, 'message', '')}"
-                    if self._is_retryable(resp):
-                        self._sleep_backoff(attempt)
-                        continue
-                    raise QwenError(f"DashScope error: {last_err}")
-
-                # 提取文本
+                # 文本提取
                 try:
-                    text = resp.output.choices[0].message.content
+                    text = resp.choices[0].message.content or ""
                 except Exception:
-                    text = str(resp.output)
-                if isinstance(text, list):
-                    # 多模态情况，拼一下
-                    text = "".join(seg.get("text", "") for seg in text if isinstance(seg, dict))
+                    text = str(resp)
 
                 # 统计 + 日志
                 _STATS.add(self.model, resp.usage)
                 if self.log_path:
                     self._log_call(prompt, text, resp.usage, meta)
-                return text or ""
-            except QwenError:
-                raise
+                return text
+            except (RateLimitError, APITimeoutError, APIConnectionError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                if attempt < self.max_retries - 1:
+                    self._sleep_backoff(attempt)
+                    continue
+                raise QwenError(f"调用失败 ({self.max_retries} 次): {last_err}")
+            except APIError as e:
+                last_err = f"{type(e).__name__}: {e}"
+                # 5xx 才重试，4xx 直接抛
+                sc = getattr(e, "status_code", None) or 0
+                if sc >= 500 and attempt < self.max_retries - 1:
+                    self._sleep_backoff(attempt)
+                    continue
+                raise QwenError(f"DashScope error: {last_err}")
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 if attempt < self.max_retries - 1:
@@ -172,17 +193,6 @@ class QwenLLM:
                 raise QwenError(f"调用失败 ({self.max_retries} 次): {last_err}")
 
         raise QwenError(f"调用失败: {last_err}")
-
-    # ---- 工具 ----
-    @staticmethod
-    def _is_retryable(resp) -> bool:
-        code = str(getattr(resp, "code", "") or "")
-        sc = int(getattr(resp, "status_code", 0) or 0)
-        if sc in (408, 429, 500, 502, 503, 504):
-            return True
-        if any(x in code for x in ("Throttling", "Timeout", "ServerInternal", "RateLimit")):
-            return True
-        return False
 
     @staticmethod
     def _sleep_backoff(attempt: int):
@@ -196,8 +206,8 @@ class QwenLLM:
             "prompt_chars": len(prompt),
             "output": output,
             "usage": {
-                "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
                 "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
             },
         }
@@ -213,5 +223,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     llm = QwenLLM()
     out = llm.chat("回复一个字：你好。", max_tokens=4)
-    print("model output:", out)
+    print("model:", llm.model)
+    print("output:", out)
     print("token stats:", get_token_stats().to_dict())
