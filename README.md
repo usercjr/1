@@ -4,15 +4,6 @@
 > 5 个域 × 20 题 = 100 道 A 榜题（mcq/multi/tf）。
 > 约束：仅 Qwen 系列 API，禁止 embedding 模型；离线解析免费，在线 token 5M 预算。
 
-## 当前成绩
-
-| 版本 | 改动 | FinalScore | Acc | Total Tokens |
-|---|---|---|---|---|
-| baseline | 出题方裸跑 qwen-plus | 40.18 | 49% | 3.0M |
-| v1 | BM25 + top_k=5 | 44.49 | 45% | 188K |
-| v2 | top_k=8 | 44.49 | 45% | 287K |
-| **v3** | **5 域 prompt + JSON CoT + 选项增强 + 条款 boost** | **55.65** | **57%** | 395K |
-| v3.7 | 切 qwen3.7-plus + thinking mode | TBD | TBD | 455K |
 
 ## 系统架构
 
