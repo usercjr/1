@@ -1,0 +1,34 @@
+# 敏感配置
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 数据 & 中间产物
+data/parsed/
+data/chunks/
+data/index/
+outputs/
+public_dataset_upload/
+*.pkl
+*.jsonl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 参考代码（别人的仓库，不混入我们 git）
+AFAC-4-main/
+afac2026-financial-agent-master/
+reference/
+
+# OneDrive 临时文件
+*.tmp
+.~lock.*
+*.lnk
