@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from agent import config
 from agent.llm import QwenLLM
-from agent.postproc import normalize
+from agent.postproc import normalize, extract_or_none
 from agent.prompts import build_prompt
 from agent.retriever import Retriever
 
@@ -34,6 +34,31 @@ _OPTION_HIT_WEIGHT = 0.7
 _OPTION_TOP_K = 2
 # 选项文本过短就不单独检索
 _OPTION_MIN_CHARS = 8
+
+
+def _budget_by_doc(hits, total_char_budget: int):
+    """按文档分配证据字符预算（学自队友）：每个文档至少 max(1500, 总预算/文档数) 字符，
+    保证多文档对比题每篇都有足够证据，不被某一篇长文档挤占。每篇至少保留 1 个 chunk。"""
+    by_doc: Dict[str, List[Dict[str, Any]]] = {}
+    order: List[str] = []
+    for h in sorted(hits, key=lambda x: -x.get("score", 0.0)):
+        d = h["doc_id"]
+        if d not in by_doc:
+            by_doc[d] = []
+            order.append(d)
+        by_doc[d].append(h)
+    per_doc = max(1500, total_char_budget // max(1, len(by_doc)))
+    kept: List[Dict[str, Any]] = []
+    for d in order:
+        used = 0
+        for h in by_doc[d]:
+            tlen = len(h.get("text", "") or "")
+            if used > 0 and used + tlen > per_doc:
+                continue
+            kept.append(h)
+            used += tlen
+    kept.sort(key=lambda h: -h.get("score", 0.0))
+    return kept
 
 
 @dataclass
@@ -134,20 +159,31 @@ class Solver:
         if not hits:
             log.warning(f"[{qid}] 检索为空")
 
+        # 1.5) 按文档分配证据字符预算（多文档题每篇都有料，学自队友）
+        hits = _budget_by_doc(hits, config.EVIDENCE_TOTAL_CHAR_BUDGET)
+
         # 2) 构造 prompt（含 5 个域 system prompt + JSON CoT 模板）
         prompt = build_prompt(question, hits, max_chunk_chars=self.max_chunk_chars)
 
-        # 3) 调 LLM（JSON CoT 需要更多 completion token）
-        # 估算：4 个选项的 analysis 各 ~30 字 + answer ≈ 200 token，给 400 buffer
-        max_tok = 200 if fmt == "tf" else 400
-        raw = self.llm.chat(
-            prompt,
-            max_tokens=max_tok,
-            meta={"qid": qid, "fmt": fmt, "domain": domain, "mode": mode},
-        )
+        # 3) 调 LLM（逐项分析需要更多 completion token；tf 题简单给少些）
+        meta = {"qid": qid, "fmt": fmt, "domain": domain, "mode": mode}
+        max_tok = 300 if fmt == "tf" else config.MAX_COMPLETION_TOKENS
+        raw = self.llm.chat(prompt, max_tokens=max_tok, meta=meta)
 
-        # 4) 答案抽取（先尝试 JSON，再正则兜底）
-        answer = normalize(raw, fmt)
+        # 4) 答案抽取；抽不到则强制重答一次（学自队友 retry）
+        answer = extract_or_none(raw, fmt)
+        if answer is None:
+            retry_prompt = (
+                prompt
+                + "\n\n上面未给出可解析的答案。请只输出一行最终答案，"
+                  '格式严格为 JSON：{"answer":"<字母，多选按字母升序如 AC>"}'
+            )
+            raw_retry = self.llm.chat(retry_prompt, max_tokens=40, meta={**meta, "retry": True})
+            answer = extract_or_none(raw_retry, fmt)
+            if answer is not None:
+                raw = raw + "\n[retry] " + raw_retry
+        if answer is None:
+            answer = normalize(raw, fmt)  # 最终合法兜底
 
         return SolverResult(
             qid=qid,

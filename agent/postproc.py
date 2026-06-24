@@ -97,3 +97,13 @@ def normalize(raw: str, fmt: str) -> str:
     if fmt == "multi":
         return normalize_multi(raw)
     return normalize_mcq(raw)
+
+
+def extract_or_none(raw: str, fmt: str) -> Optional[str]:
+    """与 normalize 相同，但抽不到任何有效字母时返回 None（不兜底 'A'）。
+    供 solver 判断"解析失败"以触发一次强制重答（学自队友 retry 机制）。"""
+    js = _try_parse_json(raw)
+    src = js if js is not None else (raw or "")
+    if not _extract_letters(src):
+        return None
+    return normalize(raw, fmt)

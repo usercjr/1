@@ -159,6 +159,9 @@ class QwenLLM:
                     temperature=temperature,
                     top_p=0.1,
                     timeout=self.timeout,
+                    # qwen3 系列（如 qwen3.7-plus）是思考模型，必须关掉 thinking 否则 token 爆炸；
+                    # qwen-max 等非思考模型会忽略此参数。学自队友 finance_agent_teammates_share。
+                    extra_body={"enable_thinking": False},
                 )
                 # 文本提取
                 try:
