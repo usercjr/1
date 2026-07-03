@@ -34,8 +34,9 @@ log = logging.getLogger(__name__)
 _OPTION_HIT_WEIGHT = 0.7
 # 每个选项额外捞 chunk 数
 _OPTION_TOP_K = 2
-# 选项文本过短就不单独检索
-_OPTION_MIN_CHARS = 8
+# 选项文本过短就不单独检索（4=放过 tf 的"正确/错误"，但保留纯产品名选项，
+# 如 ins_a_019-D"平安富鸿金生"6 字被 8 挡掉 → 犹豫期条款证据进不来）
+_OPTION_MIN_CHARS = 4
 # 文档身份头注入开关。队友 A/B 实测此项可能净负(无关封面文本挤占注意力→多选漏选),
 # 故设为开关,便于隔离验证(True=注入 / False=关闭)。
 _INJECT_DOC_HEADERS = True
@@ -51,13 +52,37 @@ _RECHECK_MAX_PER_Q = 2          # 单题最多复核选项数（控 token）
 _RECHECK_TOP_K = 3              # 复核时定向补检 chunk 数
 _RECHECK_CHUNK_CHARS = 600
 # 首答分析中的"证据缺口"标志词
+# 注意"未直接提供/没有直接给出/缺乏直接支持"这类插入"直接"的变体（fin 域高频，
+# v8 里 fin_a_002-A/fin_a_005-A/fin_a_012-B 均因此漏触发复核）。
 _GAP_RE = re.compile(
     r"未提及|未提到|未找到|没有找到|未给出|未提供|未出现|未涉及|没有提及|"
-    r"缺乏.{0,6}(依据|证据|信息)|无相关|没有相关|无法(?:确定|判断|证实)|"
-    r"证据中没有|证据未|无证据|没有证据|不足以|没有.{0,4}信息|未能找到|未在证据"
+    r"缺乏.{0,8}(依据|证据|信息|支持)|无相关|没有相关|无法(?:确定|判断|证实)|"
+    r"证据中没有|证据未|无证据|没有证据|不足以|没有.{0,4}信息|未能找到|未在证据|"
+    r"未直接(?:提供|给出|披露|说明)|没有直接(?:给出|提供|披露)|"
+    r"无法直接(?:计算|比较|得出|确认)|未.{0,4}直接支持|"
+    r"未明确(?:说明|提及|规定|表述|给出)"
 )
 # 文档对照表里每份文档的身份摘要字符数
 _ROSTER_HEAD_CHARS = 80
+
+# ---- 财报关键指标钉入（规则式定位，0 token，合规：纯正则非模型）----
+# 年报对比题反复需要 营收/归母净利/现金流(+同比)、研发占比、分红，且都在固定结构表块里；
+# BM25 常召不回这些表块（v8 里 fin_a_002/005/012 的营收/净利证据缺失即此因）→ 直接钉入。
+_FIN_DOMAIN = "financial_reports"
+_FIN_PIN_SCORE = 8e9          # 低于身份头(9e9)、高于一切检索结果
+_FIN_PIN_CHARS = 700          # 研发/分红钉入块截断；主表不截（数字密集）
+_FIN_EXTRA_BUDGET = 3000      # fin 域证据总预算增量（给钉入块腾空间，不挤占检索证据）
+_RE_FIN_RD_TRIG = re.compile(r"研发")
+_RE_FIN_DIV_TRIG = re.compile(r"分红|股利|股息|派息|派现|利润分配|回购")
+_RE_FIN_RD = re.compile(r"研发投入总额占营业收入|研发投入占营业收入|研发投入总额.{0,6}占|研发投入合计.{0,20}占")
+_RE_FIN_DIV = re.compile(r"利润分配预案|每 ?10 ?股派|现金分红总额|派发现金红利|末期股息|全年股息|派息")
+
+
+def _fin_key_table_pred(t: str) -> bool:
+    """主要会计数据表块：核心科目 + 同比字样同现。"""
+    return (("营业收入" in t or "营业总收入" in t)
+            and ("净利润" in t or "现金流量净额" in t)
+            and ("增减" in t or "同比" in t))
 
 
 def _budget_by_doc(hits, total_char_budget: int):
@@ -198,6 +223,37 @@ class Solver:
                 })
                 existing.add(c["chunk_id"])
         return heads + hits
+
+    # ---- 财报关键指标钉入 ----
+    def _pin_fin_key_chunks(self, hits, question, doc_ids, domain):
+        """financial_reports oracle 题：每份年报的"主要会计数据"表块固定钉入证据；
+        题目涉及研发/分红时再钉对应表块。规则式定位（find_doc_chunks），0 token。"""
+        if domain != _FIN_DOMAIN or not doc_ids:
+            return hits
+        opts = question.get("options") or {}
+        qtext = question.get("question", "") + " " + " ".join(v or "" for v in opts.values())
+        wants = [(_fin_key_table_pred, 2, "主要指标", 0)]
+        if _RE_FIN_RD_TRIG.search(qtext):
+            wants.append((lambda t: bool(_RE_FIN_RD.search(t)), 1, "研发投入", _FIN_PIN_CHARS))
+        if _RE_FIN_DIV_TRIG.search(qtext):
+            wants.append((lambda t: bool(_RE_FIN_DIV.search(t)), 2, "利润分配", _FIN_PIN_CHARS))
+        existing = {h["chunk_id"] for h in hits}
+        pins: List[Dict[str, Any]] = []
+        for d in doc_ids:
+            for pred, n, label, cap in wants:
+                for c in self.retriever.find_doc_chunks(domain, d, pred, n=n):
+                    if c["chunk_id"] in existing:
+                        continue
+                    text = c.get("text") or ""
+                    pins.append({
+                        "chunk_id": c["chunk_id"], "doc_id": c["doc_id"], "domain": domain,
+                        "title": c.get("title", ""), "page": c.get("page", 0),
+                        "section": f"【关键指标·{label}】" + (c.get("section") or ""),
+                        "text": text[:cap] if cap else text,
+                        "score": _FIN_PIN_SCORE,
+                    })
+                    existing.add(c["chunk_id"])
+        return pins + hits
 
     # ---- 文档对照表（多文档题序数指代）----
     def _doc_roster(self, question, domain) -> Tuple[str, Dict[str, int]]:
@@ -348,8 +404,15 @@ class Solver:
         if _INJECT_DOC_HEADERS:
             hits = self._inject_doc_headers(hits, mode, question, domain)
 
-        # 1.5) 按文档分配证据字符预算（多文档题每篇都有料，学自队友）
-        hits = _budget_by_doc(hits, config.EVIDENCE_TOTAL_CHAR_BUDGET)
+        # 1.45) 财报关键指标钉入（主要会计数据表必进；研发/分红按题目触发）
+        hits = self._pin_fin_key_chunks(hits, question, doc_ids, domain)
+
+        # 1.5) 按文档分配证据字符预算（多文档题每篇都有料，学自队友；
+        #      fin 域加预算给钉入表块腾空间，避免挤掉检索证据）
+        budget = config.EVIDENCE_TOTAL_CHAR_BUDGET
+        if domain == _FIN_DOMAIN:
+            budget += _FIN_EXTRA_BUDGET
+        hits = _budget_by_doc(hits, budget)
 
         # 1.6) 选项保底证据：每个选项的 top-1 命中若被预算挤掉/未入池，截断后追加。
         #      只追加不挤占 → 保证逐项判断时"每个选项都有料"，治多选漏选的证据缺口。

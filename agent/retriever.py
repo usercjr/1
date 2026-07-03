@@ -131,6 +131,26 @@ class Retriever:
                     break
         return out
 
+    # ---- 规则式 chunk 定位（0 token）----
+    def find_doc_chunks(self, domain: Optional[str], doc_id: str, predicate, n: int = 1) -> List[Dict[str, Any]]:
+        """在指定文档内按谓词（text -> bool）顺序取前 n 个 chunk。
+        用于把年报"主要会计数据/研发投入/利润分配"等固定结构表块钉入证据。"""
+        if not domain:
+            return []
+        try:
+            idx = self._load(domain)
+        except FileNotFoundError:
+            return []
+        out: List[Dict[str, Any]] = []
+        for c in idx["chunks"]:
+            if c.get("doc_id") != doc_id:
+                continue
+            if predicate(c.get("text") or ""):
+                out.append(c)
+                if len(out) >= n:
+                    break
+        return out
+
     # ---- 单域检索 ----
     def _search_one(
         self,
