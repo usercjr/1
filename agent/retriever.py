@@ -113,6 +113,24 @@ class Retriever:
             except FileNotFoundError:
                 log.warning(f"跳过域 {d}（无索引）")
 
+    # ---- 文档身份头（封面/首页）----
+    def doc_head(self, domain: Optional[str], doc_id: str, n: int = 1) -> List[Dict[str, Any]]:
+        """返回某文档最前面的 n 个 chunk（通常是封面/首页，含发行人/证券简称/
+        文件类型等身份信息）。用于跨文档比对题修复"张冠李戴"。"""
+        if not domain:
+            return []
+        try:
+            idx = self._load(domain)
+        except FileNotFoundError:
+            return []
+        out: List[Dict[str, Any]] = []
+        for c in idx["chunks"]:
+            if c.get("doc_id") == doc_id:
+                out.append(c)
+                if len(out) >= n:
+                    break
+        return out
+
     # ---- 单域检索 ----
     def _search_one(
         self,

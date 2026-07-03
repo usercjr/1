@@ -42,14 +42,24 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:half] + "……" + text[-half:]
 
 
-def render_evidence(hits: List[Dict[str, Any]], max_chars: int = 700) -> str:
-    """证据片段排版。"""
+def render_evidence(
+    hits: List[Dict[str, Any]],
+    max_chars: int = 700,
+    doc_ord: Dict[str, int] | None = None,
+) -> str:
+    """证据片段排版。doc_ord: doc_id → 题目 doc_ids 中的序号（1 起），
+    用于把每条证据标注为"第 N 份文档"，防止跨文档比对题张冠李戴。"""
     lines: List[str] = []
     for i, h in enumerate(hits, 1):
         sec = h.get("section") or ""
         sec_part = f" {sec}" if sec else ""
         page_part = f" p{h.get('page')}" if h.get("page") else ""
-        head = f"[证据{i}] {h.get('doc_id', '?')}{sec_part}{page_part}"
+        ord_part = ""
+        if doc_ord:
+            n = doc_ord.get(h.get("doc_id", ""))
+            if n:
+                ord_part = f"【第{n}份文档】"
+        head = f"[证据{i}] {ord_part}{h.get('doc_id', '?')}{sec_part}{page_part}"
         body = _truncate(h.get("text", ""), max_chars)
         lines.append(head + "\n" + body)
     return "\n\n".join(lines)
@@ -73,6 +83,8 @@ _JSON_INSTRUCTION_MULTI = """
 
 判断规则：
 - 独立判断每个选项是否被证据明确支持；证据未提及的选项视为错误，不要纳入答案。
+- 漏选与错选同样计为全错：证据（含任何一条证据片段）明确支持的选项必须全部选入，一个都不能漏；证据不支持的一个都不能选。
+- 数值/日期类选项：先在证据中找到对应数字再比对，数字相符即支持。
 - answer 至少包含一个字母；多选题最多 4 个字母（ABCD）。
 - 输出必须是合法 JSON，键值都用双引号。
 """
@@ -143,13 +155,19 @@ def build_prompt(
     question_obj: Dict[str, Any],
     hits: List[Dict[str, Any]],
     max_chunk_chars: int = 700,
+    doc_roster: str = "",
+    doc_ord: Dict[str, int] | None = None,
 ) -> str:
-    """根据 domain + answer_format 分发模板。"""
+    """根据 domain + answer_format 分发模板。
+    doc_roster: 多文档题的"文档对照表"文本块（第 N 份文档 = doc_id + 身份摘要），
+    与 doc_ord 配合，让"第一份/第二份文档"类选项有明确指代。"""
     fmt = (question_obj.get("answer_format") or "mcq").lower()
     domain = (question_obj.get("domain") or "").lower()
     q = question_obj.get("question", "")
     opts = question_obj.get("options", {}) or {}
-    evidence = render_evidence(hits, max_chars=max_chunk_chars)
+    evidence = render_evidence(hits, max_chars=max_chunk_chars, doc_ord=doc_ord)
+    if doc_roster:
+        evidence = doc_roster + "\n\n" + evidence
     system = _load_domain_system(domain)
 
     if fmt == "mcq":

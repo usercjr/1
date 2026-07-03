@@ -71,11 +71,11 @@ log = logging.getLogger("index")
 # ---------------------------------------------------------------------------
 # 切片超参
 # ---------------------------------------------------------------------------
-MAX_CHARS = 600        # 单 chunk 上限
-MIN_CHARS = 80         # 短于此与上一块合并
+MAX_CHARS = 1000        # 单 chunk 上限
+MIN_CHARS = 120         # 短于此与上一块合并
 TARGET_CHARS = 500     # 软目标
-OVERLAP = 80           # 滑窗 overlap
-ARTICLE_HARD_CAP = 1200  # 单条条文超此则强切
+OVERLAP = 120           # 滑窗 overlap
+ARTICLE_HARD_CAP = 1800  # 单条条文超此则强切
 
 # 中文数字
 _CHN_NUM = "一二三四五六七八九十百千零0-9"

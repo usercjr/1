@@ -152,6 +152,11 @@ class QwenLLM:
         last_err: Optional[str] = None
         for attempt in range(self.max_retries):
             try:
+                # 仅对 qwen3 思考系列关 thinking（否则 token 爆炸）；qwen-max 等不传此参数，
+                # 保持与 v4 完全一致，避免误伤需要推理的单选题。
+                _kwargs = {}
+                if "qwen3" in (self.model or "").lower():
+                    _kwargs["extra_body"] = {"enable_thinking": False}
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
@@ -159,9 +164,7 @@ class QwenLLM:
                     temperature=temperature,
                     top_p=0.1,
                     timeout=self.timeout,
-                    # qwen3 系列（如 qwen3.7-plus）是思考模型，必须关掉 thinking 否则 token 爆炸；
-                    # qwen-max 等非思考模型会忽略此参数。学自队友 finance_agent_teammates_share。
-                    extra_body={"enable_thinking": False},
+                    **_kwargs,
                 )
                 # 文本提取
                 try:
