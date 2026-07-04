@@ -66,6 +66,17 @@ _GAP_RE = re.compile(
 # 文档对照表里每份文档的身份摘要字符数
 _ROSTER_HEAD_CHARS = 80
 
+# ---- B 榜（blind）文档选择：Qwen 从候选中挑出题目真正涉及的文档 ----
+# 动机：候选 12-15 份直接喂 chunk 检索时，证据中 65-74% 来自错误文档（盲测 33/63 vs
+# oracle 50/63 的主因）。合规：Qwen 系列模型参与检索/rerank 是允许的（仅禁非 Qwen）。
+_DOC_SELECT_ENABLED = True
+_DOC_SELECT_HEAD_CHARS = 120   # 每份候选文档的身份摘要长度
+_DOC_SELECT_MAX_TOKENS = 120
+_DOC_SELECT_MAX_PICK = 4
+# reg 跳过文档选择：案例组合题不点名、处罚决定书封面雷同，选择易挑错同类文档；
+# 而 reg 宽候选盲测本就接近 oracle（9/11），15 份候选靠 chunk 级 BM25 排序即可。
+_DOC_SELECT_SKIP_DOMAINS = {"regulatory"}
+
 # ---- 财报关键指标钉入（规则式定位，0 token，合规：纯正则非模型）----
 # 年报对比题反复需要 营收/归母净利/现金流(+同比)、研发占比、分红，且都在固定结构表块里；
 # BM25 常召不回这些表块（v8 里 fin_a_002/005/012 的营收/净利证据缺失即此因）→ 直接钉入。
@@ -239,15 +250,15 @@ class Solver:
         return hits[:max_total], guards
 
     # ---- 文档身份头注入 ----
-    def _inject_doc_headers(self, hits, mode, question, domain):
+    def _inject_doc_headers(self, hits, trusted_ids, domain):
         """为每份相关文档置顶注入封面/首页 chunk（发行人/证券简称/文件类型等身份信息），
-        让模型清楚"每份文档是谁"，修复跨文档比对题的张冠李戴。"""
+        让模型清楚"每份文档是谁"，修复跨文档比对题的张冠李戴。
+        trusted_ids：oracle=题目 doc_ids；blind=别名命中，均额外补齐头。"""
         want: Dict[str, str] = {}
         for h in hits:
             want.setdefault(h["doc_id"], h.get("domain") or domain)
-        if mode == "oracle":
-            for d in (question.get("doc_ids") or []):
-                want.setdefault(d, domain)
+        for d in (trusted_ids or []):
+            want.setdefault(d, domain)
         existing = {h["chunk_id"] for h in hits}
         heads: List[Dict[str, Any]] = []
         for d, dom in want.items():
@@ -340,12 +351,60 @@ class Solver:
                     existing.add(c["chunk_id"])
         return pins + hits
 
+    # ---- B 榜文档选择（Qwen 从候选中挑题目涉及的文档）----
+    def _select_docs_llm(
+        self,
+        question: Dict[str, Any],
+        candidates: List[str],
+        domain: Optional[str],
+        meta: Dict[str, Any],
+    ) -> List[str]:
+        """给出候选文档身份摘要，让 Qwen 选出回答本题所需的文档（按题目提及顺序）。
+        解析失败/选空 → 返回 []（调用方回退到别名命中/BM25 头部）。"""
+        query = self.build_query(question)
+        lines = []
+        for d in candidates:
+            heads = self.retriever.doc_head(domain, d, n=1)
+            ident = ((heads[0].get("text") or "") if heads else "")
+            ident = ident[:_DOC_SELECT_HEAD_CHARS].replace("\n", " ").strip()
+            # 附本题相关的 top-1 片段：封面雷同的文档（处罚决定书/募集说明书）靠内容区分
+            snip = ""
+            top = self.retriever.search(query, domain=domain, doc_ids=[d], top_k=1)
+            if top:
+                snip = (top[0].get("text") or "")[:150].replace("\n", " ").strip()
+            lines.append(f"- {d}: {ident}\n  相关片段: {snip}")
+        opts = question.get("options") or {}
+        opt_block = "\n".join(f"{k}. {v}" for k, v in opts.items() if v)
+        prompt = (
+            "你是金融文档检索助手。下面是候选文档清单（doc_id: 文档身份信息 + 与题目相关的"
+            "内容片段）和一道题目。\n"
+            "请选出回答该题必须阅读的全部文档（通常 1-4 份，宁全勿漏：题目和选项涉及的每个"
+            "主体/产品/法规/报告都要选到；对比类题目须选入所有被对比的文档）。"
+            "若题目用\"第一份文档/第二份文档\"等序数指代，请按题意顺序排列输出。\n\n"
+            "【候选文档】\n" + "\n".join(lines) + "\n\n"
+            f"【题目】{question.get('question','')}\n【选项】\n{opt_block}\n\n"
+            '只输出一行 JSON：{"docs":["doc_id1","doc_id2"]}'
+        )
+        try:
+            out = self.llm.chat(prompt, max_tokens=_DOC_SELECT_MAX_TOKENS,
+                                meta={**meta, "doc_select": True})
+        except Exception as e:
+            log.warning(f"[{meta.get('qid')}] doc_select 调用失败: {e}")
+            return []
+        m = re.search(r'"docs"\s*:\s*\[([^\]]*)\]', out or "")
+        if not m:
+            return []
+        picked = re.findall(r'"([^"]+)"', m.group(1))
+        cand_set = set(candidates)
+        return [d for d in picked if d in cand_set][:_DOC_SELECT_MAX_PICK]
+
     # ---- 文档对照表（多文档题序数指代）----
-    def _doc_roster(self, question, domain) -> Tuple[str, Dict[str, int]]:
-        """题目给了 ≥2 个 doc_ids 时，生成"第 N 份文档 = doc_id：身份摘要"对照表。
+    def _doc_roster(self, ids: Optional[List[str]], domain) -> Tuple[str, Dict[str, int]]:
+        """给定 ≥2 个 doc_ids（oracle=题目提供；blind=别名按题面首现排序）时，
+        生成"第 N 份文档 = doc_id：身份摘要"对照表。
         修复 fc 域"第一份/第二份文档"类选项因序数指代不明导致的张冠李戴
         （fc_a_001/002/004/019/020 五题在 v6 全错，机制即此）。"""
-        ids = question.get("doc_ids") or []
+        ids = ids or []
         if len(ids) < 2:
             return "", {}
         doc_ord: Dict[str, int] = {}
@@ -467,15 +526,38 @@ class Solver:
         fmt = (question.get("answer_format") or "mcq").lower()
 
         # 1) 检索（按 mode 选 doc_ids/domain）
+        # blind（domain/global）模式：先做文档定位（别名强命中 + BM25 补足），
+        # 再把候选 doc_ids 喂给与 oracle 相同的整条链路（对照表/钉入/复核）。
+        # roster/pins 只用别名命中（高精度、含题面首现顺序），BM25 补充仅参与过滤。
         if mode == "oracle":
             doc_ids = question.get("doc_ids") or None
             search_domain: Optional[str] = domain
-        elif mode == "domain":
-            doc_ids = None
-            search_domain = domain
-        elif mode == "global":
-            doc_ids = None
-            search_domain = None
+            trusted_ids: Optional[List[str]] = list(doc_ids) if doc_ids else None
+        elif mode in ("domain", "global"):
+            search_domain = domain if mode == "domain" else None
+            query = self.build_query(question)
+            alias_hits = [d for d, _ in self.retriever.alias_candidates(query, search_domain)]
+            resolved = self.retriever.resolve_doc_ids(query, search_domain)
+            # Qwen 文档选择：候选(≈12)身份摘要 → 选出题目真正涉及的 1-4 份，
+            # 与别名命中取并集（选择漏了点名文档时别名兜底）
+            selected: List[str] = []
+            if (_DOC_SELECT_ENABLED and self.llm is not None and resolved
+                    and domain not in _DOC_SELECT_SKIP_DOMAINS):
+                selected = self._select_docs_llm(
+                    question, resolved, search_domain,
+                    {"qid": qid, "fmt": fmt, "domain": domain, "mode": mode})
+            if selected:
+                # 合并顺序：别名/题面编号命中在前（自带题面首现顺序，序数指代以此为准；
+                # fc_a_019 曾因选择结果排前导致 roster 序数错位），选择结果去重后补充在后
+                if alias_hits:
+                    merged = alias_hits + [d for d in selected if d not in alias_hits]
+                else:
+                    merged = selected  # 题面不点名时用选择顺序（prompt 已要求按题意排序）
+                doc_ids = merged
+                trusted_ids = merged
+            else:
+                doc_ids = resolved or None
+                trusted_ids = alias_hits or None
         else:
             raise ValueError(f"未知 mode: {mode}")
         hits, guards = self._option_augmented_retrieve(
@@ -487,12 +569,13 @@ class Solver:
         # 1.4) 文档身份头注入（可开关，见 _INJECT_DOC_HEADERS）：把每份相关文档的封面/首页
         #      置顶进证据，修跨文档"张冠李戴"。注意：可能挤占注意力致多选漏选，需 A/B 验证。
         if _INJECT_DOC_HEADERS:
-            hits = self._inject_doc_headers(hits, mode, question, domain)
+            hits = self._inject_doc_headers(hits, trusted_ids, domain)
 
         # 1.45) 财报关键指标钉入（主要会计数据表必进；研发/分红按题目触发）
-        hits = self._pin_fin_key_chunks(hits, question, doc_ids, domain)
-        # 1.46) 保险条款钉入（犹豫期/身故保险金/贷款/免赔额等按题目触发）
-        hits = self._pin_ins_clause_chunks(hits, question, doc_ids, domain)
+        #        blind 模式只钉别名命中的文档（trusted_ids），不给 BM25 补充文档钉表
+        hits = self._pin_fin_key_chunks(hits, question, trusted_ids, domain)
+        # 1.46) 保险条款钉入（犹豫期/免赔额按题目触发）
+        hits = self._pin_ins_clause_chunks(hits, question, trusted_ids, domain)
 
         # 1.5) 按文档分配证据字符预算（多文档题每篇都有料，学自队友；
         #      fin 域加预算给钉入表块腾空间，避免挤掉检索证据）
@@ -516,7 +599,8 @@ class Solver:
             kept_ids.add(g["chunk_id"])
 
         # 1.7) 多文档题：文档对照表 + 证据按"第 N 份文档"标注
-        roster, doc_ord = self._doc_roster(question, domain) if mode == "oracle" else ("", {})
+        #      oracle 用题目 doc_ids 顺序；blind 用别名题面首现顺序（≥2 个才建）
+        roster, doc_ord = self._doc_roster(trusted_ids, domain)
 
         # 2) 构造 prompt（含 5 个域 system prompt + JSON CoT 模板）
         prompt = build_prompt(question, hits, max_chunk_chars=self.max_chunk_chars,

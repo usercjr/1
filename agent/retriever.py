@@ -21,14 +21,28 @@ BM25 检索器。统一的 query 接口：
 """
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import jieba
+
+
+def _norm_text(s: str) -> str:
+    """全角→半角 + 小写，用于别名匹配（ｅ生保 vs e生保）。"""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if 0xFF01 <= o <= 0xFF5E:
+            ch = chr(o - 0xFEE0)
+        elif o == 0x3000:
+            ch = " "
+        out.append(ch)
+    return "".join(out).lower()
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +144,129 @@ class Retriever:
                 if len(out) >= n:
                     break
         return out
+
+    # ---- 实体别名 → 候选文档（B 榜文档定位，0 token）----
+    def _load_aliases(self) -> Dict[str, Dict[str, List[List[str]]]]:
+        if not hasattr(self, "_aliases"):
+            fp = self.index_dir / "doc_aliases.json"
+            self._aliases = json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
+        return self._aliases
+
+    # 题面直接引用文档编号的写法 → doc_id（fc 题面用 fc_text_002 指 text02）
+    _RE_QUERY_DOCID = [
+        (re.compile(r"fc[_\s]?text[_\s]?0*(\d+)", re.I), lambda m: f"text{int(m.group(1)):02d}"),
+        (re.compile(r"pack2[_\s]?text[_\s]?0*(\d+)", re.I), lambda m: f"pack2_text{int(m.group(1)):02d}"),
+        (re.compile(r"csrc[_\s]?0*(\d+)(_att\d+)?", re.I),
+         lambda m: f"csrc_{int(m.group(1)):04d}{m.group(2) or ''}"),
+        (re.compile(r"annual_[a-z]+_\d{4}_report", re.I), lambda m: m.group(0).lower()),
+    ]
+
+    # 数字锚：题面带小数的数字/6位代码。单个数字不唯一（"5.70"出现在 12 份文档），
+    # 真指纹是【同一 chunk 内 ≥2 个题面数字共现】（text07"5.70%→35.83%"同句、
+    # text08"91.1 亿份其中主动 56.3 亿"同段）；单数字仅当全域 ≤2 份文档含它才算。
+    _RE_ANCHOR_NUM = re.compile(r"\d+\.\d+|(?<!\d)\d{6}(?!\d)")
+    _ANCHOR_SINGLE_MAX_DOCS = 2
+
+    def number_anchor_docs(self, query: str, domain: Optional[str]) -> Dict[str, int]:
+        """返回 {doc_id: 首现位置}：数字指纹命中的文档（0 token 规则定位）。
+        解决"第一份/第二份文档"式不点名题：选项引用的具体数值即文档指纹。"""
+        nums = list(dict.fromkeys(self._RE_ANCHOR_NUM.findall(query)))
+        if not nums:
+            return {}
+        doms = [domain] if domain else self.DOMAINS
+        from itertools import combinations
+        num_docs: Dict[str, set] = {n: set() for n in nums}
+        pair_docs: Dict[Tuple[str, str], set] = {}   # 数字对 -> 同 chunk 共现的文档集
+        for dom in doms:
+            try:
+                idx = self._load(dom)
+            except FileNotFoundError:
+                continue
+            for c in idx["chunks"]:
+                t = c.get("text") or ""
+                contained = [n for n in nums if n in t]
+                for n in contained:
+                    num_docs[n].add(c["doc_id"])
+                for pair in combinations(sorted(contained), 2):
+                    pair_docs.setdefault(pair, set()).add(c["doc_id"])
+        out: Dict[str, int] = {}
+        # 1) 稀有数字对（同 chunk 共现且全域 ≤2 份文档有此组合）——防常见小数
+        #    （如"4.3/1.8"）在任何表格里都共现导致的大面积误报
+        for pair, docs in pair_docs.items():
+            if len(docs) > 2:
+                continue
+            pos = min(query.find(n) for n in pair)
+            for d in docs:
+                if d not in out or pos < out[d]:
+                    out[d] = pos
+        # 2) 全域稀有单数字（≤2 份文档含它）
+        for n, docs in num_docs.items():
+            if docs and len(docs) <= self._ANCHOR_SINGLE_MAX_DOCS:
+                pos = query.find(n)
+                for d in docs:
+                    if d not in out or pos < out[d]:
+                        out[d] = pos
+        return out
+
+    def alias_candidates(self, query: str, domain: Optional[str]) -> List[Tuple[str, int]]:
+        """返回 [(doc_id, 首现位置)]：实体别名全词命中 / 题面文档编号 / 稀有数字锚。
+        首现位置 = 在 query 中最早出现的下标，供"第一份/第二份文档"序数排序。"""
+        aliases = self._load_aliases()
+        doms = [domain] if domain else list(aliases.keys())
+        q = _norm_text(query)
+        out: Dict[str, int] = {}
+        # 0) 题面直接写文档编号（最高置信）
+        known: set = set()
+        for dom in doms:
+            try:
+                known.update(c["doc_id"] for c in self._load(dom)["chunks"])
+            except FileNotFoundError:
+                continue
+        for rx, to_id in self._RE_QUERY_DOCID:
+            for m in rx.finditer(q):
+                did = to_id(m)
+                if did in known and (did not in out or m.start() < out[did]):
+                    out[did] = m.start()
+        # 0.5) 稀有数字锚（选项引用的具体数值指纹）
+        for did, pos in self.number_anchor_docs(query, domain).items():
+            if did not in out or pos < out[did]:
+                out[did] = pos
+        for dom in doms:
+            for doc_id, groups in (aliases.get(dom) or {}).items():
+                best = None
+                for grp in groups:
+                    poss = [q.find(_norm_text(t)) for t in grp]
+                    if all(p >= 0 for p in poss):
+                        pos = min(poss)
+                        best = pos if best is None else min(best, pos)
+                if best is not None and (doc_id not in out or best < out[doc_id]):
+                    out[doc_id] = best
+        return sorted(out.items(), key=lambda x: x[1])
+
+    # 各域候选文档数：reg 文档多且"案例组合题"不点名，需要更宽的 BM25 补充。
+    # 默认 12：A 题实测未点名文档普遍排 BM25 前 12（fc_a_004@10、res_a_006@10、res_a_010@12），
+    # 候选集只用于过滤，chunk 级检索仍按分数排序，放宽几乎无代价。
+    _RESOLVE_MAX_DOCS = {"regulatory": 15}
+    _RESOLVE_DEFAULT_MAX = 12
+
+    def resolve_doc_ids(
+        self,
+        query: str,
+        domain: Optional[str],
+        max_docs: Optional[int] = None,
+    ) -> List[str]:
+        """B 榜文档定位：别名强命中（按题面首现顺序，排前，支持序数指代）
+        + BM25 文档级召回（不用 priority）始终补足到 max_docs。"""
+        if max_docs is None:
+            max_docs = self._RESOLVE_MAX_DOCS.get(domain or "", self._RESOLVE_DEFAULT_MAX)
+        cands = [d for d, _ in self.alias_candidates(query, domain)]
+        cands = cands[:max_docs]
+        for d in self.search_docs(query, domain=domain, top_k_docs=max_docs, use_priority=False):
+            if len(cands) >= max_docs:
+                break
+            if d["doc_id"] not in cands:
+                cands.append(d["doc_id"])
+        return cands
 
     # ---- 规则式 chunk 定位（0 token）----
     def find_doc_chunks(self, domain: Optional[str], doc_id: str, predicate, n: int = 1) -> List[Dict[str, Any]]:
@@ -271,9 +408,12 @@ class Retriever:
         domain: Optional[str] = None,
         top_k_docs: int = 5,
         chunks_per_doc_for_scoring: int = 3,
+        use_priority: bool = True,
     ) -> List[Dict[str, Any]]:
         """返回 [{doc_id, domain, score, title}, ...]
-        每个 doc 的得分 = 该 doc 内 top-N chunk 得分之和（× priority）。"""
+        每个 doc 的得分 = 该 doc 内 top-N chunk 得分之和（× priority）。
+        use_priority=False：文档发现场景用原始分——reg 域 csrc chunk 的 0.7 降权
+        是为 oracle 答题调的，会把处罚决定书/格式准则压出候选。"""
         toks = tokenize(query)
         if not toks:
             return []
@@ -293,7 +433,7 @@ class Retriever:
                     continue
                 c = chunks[i]
                 doc_buckets.setdefault(c["doc_id"], []).append(
-                    float(s) * float(c.get("priority", 1.0))
+                    float(s) * (float(c.get("priority", 1.0)) if use_priority else 1.0)
                 )
                 if c["doc_id"] not in doc_meta:
                     doc_meta[c["doc_id"]] = {
