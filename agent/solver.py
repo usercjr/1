@@ -60,7 +60,8 @@ _GAP_RE = re.compile(
     r"证据中没有|证据未|无证据|没有证据|不足以|没有.{0,4}信息|未能找到|未在证据|"
     r"未直接(?:提供|给出|披露|说明)|没有直接(?:给出|提供|披露)|"
     r"无法直接(?:计算|比较|得出|确认)|未.{0,4}直接支持|"
-    r"未明确(?:说明|提及|规定|表述|给出)"
+    r"未明确(?:说明|提及|规定|表述|给出)|"
+    r"无依据|没有依据|依据不足|缺少依据"
 )
 # 文档对照表里每份文档的身份摘要字符数
 _ROSTER_HEAD_CHARS = 80
@@ -83,6 +84,46 @@ def _fin_key_table_pred(t: str) -> bool:
     return (("营业收入" in t or "营业总收入" in t)
             and ("净利润" in t or "现金流量净额" in t)
             and ("增减" in t or "同比" in t))
+
+
+# ---- 保险条款钉入（同 fin 思路：标准条款结构，规则式定位）----
+# ins 证据缺失型错误（如 ins_a_019：富鸿犹豫期"无息退还全部保险费"条款在索引里但
+# BM25 召不回）。保险条款有标准小节结构（犹豫期/身故保险金/贷款/免赔额…），
+# 题目提到哪类条款，就把每份相关文档的该条款块钉入。
+_INS_DOMAIN = "insurance"
+_INS_PIN_CHARS = 500
+_INS_PIN_MAX = 8  # 单题钉入上限（ins 题常给 4 份文档）
+_RE_TOC = re.compile(r"\.{6,}|…{3,}|目录")  # 目录页特征，不作为条款证据
+
+
+def _not_toc(t: str) -> bool:
+    return not _RE_TOC.search(t)
+
+
+# 只保留有明确失败案例支撑、选块精度经目检过关的规则；宁少勿滥
+# （贷款/宽限期/退保/自杀等规则试验中选块精度差，删除——主检索+选项保底已覆盖）。
+_INS_PIN_RULES = [
+    # (题目触发正则, 条款主关键词, 特征词元组——特征词需出现在主关键词后 120 字窗口内)
+    # 犹豫期退费条款正文的标志：犹豫期 + 近处"退还…全部/全额/无息/已收保险费"
+    (r"犹豫期", "犹豫期", ("退还您所支付的全部", "退还已收", "全额退还", "无息退还", "退还全部")),
+    # 身故保险金规则试验中选块精度差（封面/目录级噪声），已删除。
+    (r"免赔额", "免赔额", ("扣除", "抵扣")),
+]
+_INS_PIN_MIN_SCORE = 11  # 必须命中邻近特征词(+10)才可能过阈，滤掉交叉引用块
+
+
+def _clause_score(c: Dict[str, Any], kw: str, prox_terms) -> int:
+    """条款块打分：主关键词在小节标题/块首 +6（条款定义处）；出现次数累加；
+    主关键词后 120 字内出现特征词 +10（条款正文 vs 交叉引用的核心区分）。"""
+    t = c.get("text") or ""
+    sec = c.get("section") or ""
+    s = (6 if (kw in sec or kw in t[:60]) else 0) + t.count(kw)
+    for m in re.finditer(re.escape(kw), t):
+        window = t[m.end(): m.end() + 120]
+        if any(p in window for p in prox_terms):
+            s += 10
+            break
+    return s
 
 
 def _budget_by_doc(hits, total_char_budget: int):
@@ -237,10 +278,54 @@ class Solver:
             wants.append((lambda t: bool(_RE_FIN_RD.search(t)), 1, "研发投入", _FIN_PIN_CHARS))
         if _RE_FIN_DIV_TRIG.search(qtext):
             wants.append((lambda t: bool(_RE_FIN_DIV.search(t)), 2, "利润分配", _FIN_PIN_CHARS))
+        return self._apply_pins(hits, doc_ids, domain, wants, tag="关键指标")
+
+    # ---- 保险条款钉入 ----
+    def _pin_ins_clause_chunks(self, hits, question, doc_ids, domain):
+        """insurance oracle 题：题目/选项提到标准条款类别（犹豫期/身故保险金/…）时，
+        把每份相关文档的对应条款块钉入证据（截 500 字，跳过目录页）。"""
+        if domain != _INS_DOMAIN or not doc_ids:
+            return hits
+        opts = question.get("options") or {}
+        qtext = question.get("question", "") + " " + " ".join(v or "" for v in opts.values())
+        rules = [(kw, prox) for trig, kw, prox in _INS_PIN_RULES if re.search(trig, qtext)]
+        if not rules:
+            return hits
+        existing = {h["chunk_id"] for h in hits}
+        pins: List[Dict[str, Any]] = []
+        for kw, prox in rules:
+            for d in doc_ids:
+                if len(pins) >= _INS_PIN_MAX:
+                    break
+                cands = self.retriever.find_doc_chunks(
+                    domain, d,
+                    lambda t, kw=kw: kw in t and _not_toc(t),
+                    n=99)
+                if not cands:
+                    continue
+                best = max(cands, key=lambda c: _clause_score(c, kw, prox))
+                if _clause_score(best, kw, prox) < _INS_PIN_MIN_SCORE:
+                    continue  # 只有交叉引用/弱相关块，宁缺毋滥
+                if best["chunk_id"] in existing:
+                    continue
+                pins.append({
+                    "chunk_id": best["chunk_id"], "doc_id": best["doc_id"], "domain": domain,
+                    "title": best.get("title", ""), "page": best.get("page", 0),
+                    "section": f"【条款·{kw}】" + (best.get("section") or ""),
+                    "text": (best.get("text") or "")[:_INS_PIN_CHARS],
+                    "score": _FIN_PIN_SCORE,
+                })
+                existing.add(best["chunk_id"])
+        return pins + hits
+
+    # ---- 钉入公共实现 ----
+    def _apply_pins(self, hits, doc_ids, domain, wants, tag, max_pins=99):
         existing = {h["chunk_id"] for h in hits}
         pins: List[Dict[str, Any]] = []
         for d in doc_ids:
             for pred, n, label, cap in wants:
+                if len(pins) >= max_pins:
+                    break
                 for c in self.retriever.find_doc_chunks(domain, d, pred, n=n):
                     if c["chunk_id"] in existing:
                         continue
@@ -248,7 +333,7 @@ class Solver:
                     pins.append({
                         "chunk_id": c["chunk_id"], "doc_id": c["doc_id"], "domain": domain,
                         "title": c.get("title", ""), "page": c.get("page", 0),
-                        "section": f"【关键指标·{label}】" + (c.get("section") or ""),
+                        "section": f"【{tag}·{label}】" + (c.get("section") or ""),
                         "text": text[:cap] if cap else text,
                         "score": _FIN_PIN_SCORE,
                     })
@@ -406,6 +491,8 @@ class Solver:
 
         # 1.45) 财报关键指标钉入（主要会计数据表必进；研发/分红按题目触发）
         hits = self._pin_fin_key_chunks(hits, question, doc_ids, domain)
+        # 1.46) 保险条款钉入（犹豫期/身故保险金/贷款/免赔额等按题目触发）
+        hits = self._pin_ins_clause_chunks(hits, question, doc_ids, domain)
 
         # 1.5) 按文档分配证据字符预算（多文档题每篇都有料，学自队友；
         #      fin 域加预算给钉入表块腾空间，避免挤掉检索证据）
@@ -460,9 +547,9 @@ class Solver:
         if _RECHECK_ENABLED and fmt == "multi":
             new_answer, recheck_log = self._recheck_gap_options(
                 question, search_domain, doc_ids, raw, answer, hits, meta)
-            if new_answer != answer:
+            if recheck_log:  # 无论是否改答案都记录，便于审计复核行为
                 raw = raw + "\n" + recheck_log
-                answer = new_answer
+            answer = new_answer
 
         return SolverResult(
             qid=qid,

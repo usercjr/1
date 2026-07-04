@@ -163,6 +163,7 @@ class QwenLLM:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=0.1,
+                    seed=42,  # 固定 seed 压 API 非确定性（多选首答方差 ±3-5 题/跑）
                     timeout=self.timeout,
                     **_kwargs,
                 )
