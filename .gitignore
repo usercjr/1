@@ -32,3 +32,7 @@ reference/
 *.tmp
 .~lock.*
 *.lnk
+
+# 实验产物目录（保留 answer.csv 手动 force-add）
+outputs_*/
+data/parsed_md_backup/
