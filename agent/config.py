@@ -51,3 +51,6 @@ TEMPERATURE: float = float(_get("TEMPERATURE", "0.0") or 0.0)
 
 # Token 预算（用于警告）
 TOKEN_BUDGET: int = int(_get("TOKEN_BUDGET", "5000000") or 5000000)
+
+# qwen3 系思考模式开关（默认关——token 大；困难题二次意见实验时置 1 打开）
+QWEN_ENABLE_THINKING: bool = (_get("QWEN_THINKING", "") or "") in ("1", "true", "True")

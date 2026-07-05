@@ -152,11 +152,42 @@ class QwenLLM:
         last_err: Optional[str] = None
         for attempt in range(self.max_retries):
             try:
-                # 仅对 qwen3 思考系列关 thinking（否则 token 爆炸）；qwen-max 等不传此参数，
-                # 保持与 v4 完全一致，避免误伤需要推理的单选题。
+                # qwen3 思考系列默认关 thinking（否则 token 爆炸）；QWEN_THINKING=1 时
+                # 打开（困难题二次意见实验）。qwen-max 等不传此参数，保持与 v4 一致。
                 _kwargs = {}
+                thinking_on = False
                 if "qwen3" in (self.model or "").lower():
-                    _kwargs["extra_body"] = {"enable_thinking": False}
+                    thinking_on = config.QWEN_ENABLE_THINKING
+                    _kwargs["extra_body"] = {"enable_thinking": thinking_on}
+                if thinking_on:
+                    # DashScope 思考模式要求流式；累积 content（忽略 reasoning_content）
+                    stream = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=0.1,
+                        seed=42,
+                        timeout=self.timeout,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        **_kwargs,
+                    )
+                    parts: List[str] = []
+                    usage = None
+                    for chunk in stream:
+                        if getattr(chunk, "usage", None):
+                            usage = chunk.usage
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta
+                            c = getattr(delta, "content", None)
+                            if c:
+                                parts.append(c)
+                    text = "".join(parts)
+                    _STATS.add(self.model, usage or {})
+                    if self.log_path:
+                        self._log_call(prompt, text, usage or {}, meta)
+                    return text
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
