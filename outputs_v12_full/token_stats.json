@@ -1,0 +1,16 @@
+{
+  "prompt_tokens": 581328,
+  "completion_tokens": 17412,
+  "total_tokens": 598740,
+  "calls": 116,
+  "by_model": {
+    "qwen-max": {
+      "calls": 116,
+      "prompt": 581328,
+      "completion": 17412,
+      "total": 598740
+    }
+  },
+  "n_questions_solved": 100,
+  "n_errors": 0
+}

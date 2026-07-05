@@ -51,6 +51,47 @@ _RECHECK_ENABLED = True
 _RECHECK_MAX_PER_Q = 2          # 单题最多复核选项数（控 token）
 _RECHECK_TOP_K = 3              # 复核时定向补检 chunk 数
 _RECHECK_CHUNK_CHARS = 600
+# 选项指纹数字：百分比 / 亿万金额 / 带小数的数 / 6位代码（带单位提取降噪，
+# "63%"和"2500亿"是指纹，裸"63"不是）。匹配前去空格/逗号归一化（"2,500 亿"→"2500亿"）。
+_RE_OPT_NUM = re.compile(r"\d+(?:\.\d+)?%|\d+(?:\.\d+)?[亿万]|\d+\.\d+|(?<!\d)\d{6}(?!\d)")
+
+
+def _num_norm_full(s: str) -> str:
+    """全归一（去空白+逗号）：只用于从选项短文本提取指纹。"""
+    return re.sub(r"[,，\s]", "", s or "")
+
+
+def _num_norm(s: str) -> str:
+    """温和归一（只去数字内千分位逗号）：用于证据/引文的存在性匹配。
+    不能去空白——表格"63.51 65.54 66.38"去空白会连成串破坏数字边界。"""
+    return re.sub(r"(?<=\d)[,，](?=\d)", "", s or "")
+
+
+def _opt_fingerprints(text: str) -> List[str]:
+    return list(dict.fromkeys(_RE_OPT_NUM.findall(_num_norm_full(text))))
+
+
+def _num_pattern(n: str, loose: bool = False) -> "re.Pattern":
+    """指纹数字 → 匹配正则。
+    严格版（缺口检测）：整数带单位的（63% / 2500亿）匹配带小数变体（63.51%），单位必须在。
+    宽松版（引文门槛）：单位可省略——表格引文常是"63.51"而 % 在表头
+    （fc_a_004 曾因此把正确引文拦下）。"""
+    m = re.match(r"^(\d+(?:\.\d+)?)([%亿万])$", n)
+    if m:
+        base, unit = m.group(1), m.group(2)
+        dec = r"(?:\.\d+)?" if "." not in base else ""
+        u = r"\s*" + re.escape(unit) + ("?" if loose else "")
+        return re.compile(r"(?<!\d)" + re.escape(base) + dec + u)
+    if re.match(r"^\d", n):
+        return re.compile(r"(?<!\d)" + re.escape(n))
+    return re.compile(re.escape(n))
+
+
+def _nums_in(nums: List[str], text_norm: str, loose: bool = False) -> int:
+    """归一化文本中命中的指纹数字个数（按变体正则）。"""
+    return sum(1 for n in nums if _num_pattern(n, loose).search(text_norm))
+
+
 # 首答分析中的"证据缺口"标志词
 # 注意"未直接提供/没有直接给出/缺乏直接支持"这类插入"直接"的变体（fin 域高频，
 # v8 里 fin_a_002-A/fin_a_005-A/fin_a_012-B 均因此漏触发复核）。
@@ -440,6 +481,54 @@ class Solver:
             out[m.group(1)] = m.group(2)
         return out
 
+    # ---- 按指纹数字全域定位 chunk（复核补检回退用）----
+    def _find_number_chunks(
+        self,
+        nums: List[str],
+        domain: Optional[str],
+        exclude_ids: set,
+        max_chunks: int = 2,
+        prefer_doc_ids: Optional[List[str]] = None,
+        opt_text: str = "",
+    ) -> List[Dict[str, Any]]:
+        """在整个域内找含指纹数字的 chunk（0 token 精确匹配）。
+        含数字最多的 chunk 优先；排除已展示的。"""
+        if not domain:
+            return []
+        scored: List[Tuple[int, Dict[str, Any]]] = []
+        try:
+            idx = self.retriever._load(domain)
+        except FileNotFoundError:
+            return []
+        prefer = set(prefer_doc_ids or [])
+        # 选项关键词（≥3字的词，如"资产负债率"）：数字必须与语义上下文共现才是真证据
+        # （text01 供应商占比表恰好同含 63.x%/66.x%，靠关键词把 text13 资产负债率块顶上来）
+        import jieba as _jieba
+        _KW_STOP = {"文档", "第一份", "第二份", "第三份", "第四份", "提供了", "具体的"}
+        kws = ([w for w in _jieba.lcut(opt_text)
+                if len(w) >= 3 and not re.search(r"\d", w) and w not in _KW_STOP]
+               if opt_text else [])
+        for c in idx["chunks"]:
+            if c["chunk_id"] in exclude_ids:
+                continue
+            raw_t = c.get("text") or ""
+            t = _num_norm(raw_t)
+            cnt = _nums_in(nums, t)
+            if cnt > 0:
+                kw_hits = sum(1 for w in kws if w in raw_t)
+                scored.append((cnt + 2 * kw_hits, c))
+        # 题目 doc_ids 内的块优先，其内按 指纹命中+关键词共现 排序
+        scored.sort(key=lambda x: (-(x[1]["doc_id"] in prefer), -x[0]))
+        out = []
+        for cnt, c in scored[:max_chunks]:
+            out.append({
+                "chunk_id": c["chunk_id"], "doc_id": c["doc_id"], "domain": domain,
+                "title": c.get("title", ""), "page": c.get("page", 0),
+                "section": c.get("section", ""), "text": c.get("text") or "",
+                "score": 0.0,
+            })
+        return out
+
     # ---- 多选证据缺口复核 ----
     def _recheck_gap_options(
         self,
@@ -459,23 +548,59 @@ class Solver:
         if not analysis:
             return answer, ""
         shown_ids = {h["chunk_id"] for h in shown_hits}
+        shown_norm = _num_norm(" ".join(h.get("text") or "" for h in shown_hits))
         chosen = set(answer)
         logs: List[str] = []
         fired = 0
+        # 先收集全部触发候选，按信号强度排序（指纹数字多者优先——fc_a_004 曾因
+        # B/C 先占满名额导致真正缺证据的 D 没轮上），再按 cap 复核
+        cands: List[Tuple[int, str, List[str]]] = []
         for k in ("A", "B", "C", "D"):
-            if fired >= _RECHECK_MAX_PER_Q:
-                break
             if k in chosen or k not in opts:
                 continue
             note = analysis.get(k, "")
-            if not note or not _GAP_RE.search(note):
+            # 触发条件①：模型措辞承认证据缺口（依赖措辞，见 _GAP_RE）
+            wording_gap = bool(note and _GAP_RE.search(note))
+            # 触发条件②（机械，不依赖措辞）：选项含指纹数字（百分比/亿万金额/小数/代码）
+            # 但这些数字一个都没出现在已展示证据里 → 证据必然缺失
+            opt_nums = _opt_fingerprints(opts[k])
+            number_gap = bool(opt_nums) and _nums_in(opt_nums, shown_norm) == 0
+            if not (wording_gap or number_gap):
                 continue
-            # 定向补检：只要"没给模型看过"的新 chunk
+            cands.append((len(opt_nums) if number_gap else 0, k, opt_nums))
+        cands.sort(key=lambda x: (-x[0], x[1]))
+        for _sig, k, opt_nums in cands:
+            if fired >= _RECHECK_MAX_PER_Q:
+                break
+            # 选项指认"第N份文档"时，补检证据硬性限定在该文档内
+            # （fc_a_004-B 曾被 doc_ids 外的 text14"注册金额180亿"跨文档误支持）
+            restrict_ids = doc_ids
+            m_ord = re.search(r"第([一二三四1-4])份文档", opts[k])
+            if m_ord and doc_ids:
+                oi = "一二三四".find(m_ord.group(1))
+                if oi < 0:
+                    oi = int(m_ord.group(1)) - 1
+                if 0 <= oi < len(doc_ids):
+                    restrict_ids = [doc_ids[oi]]
+            # 定向补检：只要"没给模型看过"的新 chunk；oracle doc_ids 内找不到时，
+            # 数字缺口题扩到全域按指纹数字精确定位（doc_ids 是提示不是限制——
+            # res_a_002-D 的信创数据实际在 doc_ids 外的文档里）
             q_text = question.get("question", "")
             fresh = self.retriever.search(
-                f"{q_text} {opts[k]}", domain=search_domain, doc_ids=doc_ids,
+                f"{q_text} {opts[k]}", domain=search_domain, doc_ids=restrict_ids,
                 top_k=_RECHECK_TOP_K)
             new_hits = [h for h in fresh if h["chunk_id"] not in shown_ids]
+            if opt_nums and not any(
+                    _nums_in(opt_nums, _num_norm(h.get("text") or "")) > 0
+                    for h in new_hits):
+                extra = self._find_number_chunks(
+                    opt_nums, search_domain, shown_ids, prefer_doc_ids=restrict_ids,
+                    opt_text=opts[k])
+                if restrict_ids is not doc_ids:  # 指认特定文档 → 硬过滤
+                    extra = [c for c in extra if c["doc_id"] in set(restrict_ids)]
+                seen_new = {h["chunk_id"] for h in extra}
+                new_hits = (extra + [h for h in new_hits if h["chunk_id"] not in seen_new]
+                            )[:_RECHECK_TOP_K]
             if not new_hits:
                 continue
             fired += 1
@@ -493,8 +618,8 @@ class Solver:
                 f"【待复核选项{k}】{opts[k]}\n"
                 "【补充证据】\n" + "\n\n".join(ev_lines) + "\n\n"
                 "判定标准（从严）：\n"
-                "1. 证据必须直接、明确支持选项的具体断言（数字、日期、主体、条款相符），"
-                "仅话题相关或间接沾边一律不算支持。\n"
+                "1. 证据必须直接、明确支持选项的具体断言（数字、日期、主体、口径、年份相符），"
+                "仅话题相关或间接沾边一律不算支持；分部/板块数据不能支持全公司口径的断言。\n"
                 "2. 每条证据开头已标注所属文档；若选项断言的是某一份文档的内容，"
                 "只有来自该文档的证据才能支持它，来自其他文档的相同内容不算。\n"
                 "3. 有任何不确定 → support 取 false。\n"
@@ -508,6 +633,12 @@ class Solver:
                 continue
             m_sup = re.search(r'"support"\s*:\s*(true|false)', out or "", re.I)
             m_quote = re.search(r'"quote"\s*:\s*"([^"]{10,})"', out or "")
+            # 机械门槛：选项含指纹数字时，支持引文必须含其中至少一个
+            # （fin_a_017 曾用"新签4.5万亿"的引文去支持"新签2.19万亿"的选项）
+            if (m_quote and opt_nums
+                    and _nums_in(opt_nums, _num_norm(m_quote.group(1)), loose=True) == 0):
+                logs.append(f"[recheck {k}→引文无选项数字，拒绝] {(out or '').strip()[:100]}")
+                continue
             if m_sup and m_sup.group(1).lower() == "true" and m_quote:
                 chosen.add(k)
                 logs.append(f"[recheck {k}→选入] {out.strip()[:200]}")
