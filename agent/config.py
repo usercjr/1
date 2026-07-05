@@ -54,3 +54,8 @@ TOKEN_BUDGET: int = int(_get("TOKEN_BUDGET", "5000000") or 5000000)
 
 # qwen3 系思考模式开关（默认关——token 大；困难题二次意见实验时置 1 打开）
 QWEN_ENABLE_THINKING: bool = (_get("QWEN_THINKING", "") or "") in ("1", "true", "True")
+
+# 题型路由：mcq/tf 用思考模型（计算/推理题 17/17 vs qwen-max 14/17，零回归），
+# multi 仍走主模型+机制围栏（fc-D 型数字复核是其强项）。空 = 不启用路由。
+QWEN_MODEL_REASONER: str = _get("QWEN_MODEL_REASONER", "") or ""
+REASONER_MAX_TOKENS: int = int(_get("REASONER_MAX_TOKENS", "6000") or 6000)

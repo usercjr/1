@@ -127,11 +127,14 @@ class QwenLLM:
         max_retries: int = 4,
         timeout: int = 60,
         log_path: Optional[str | Path] = None,
+        enable_thinking: Optional[bool] = None,
     ):
         self.model = model or config.QWEN_MODEL
         self.max_retries = max_retries
         self.timeout = timeout
         self.log_path = Path(log_path) if log_path else None
+        # None = 跟随全局 QWEN_THINKING 环境变量；True/False = 实例级覆盖（题型路由用）
+        self.enable_thinking = enable_thinking
         self.client = _get_client(timeout=timeout)
 
     # ---- 主调用 ----
@@ -157,7 +160,9 @@ class QwenLLM:
                 _kwargs = {}
                 thinking_on = False
                 if "qwen3" in (self.model or "").lower():
-                    thinking_on = config.QWEN_ENABLE_THINKING
+                    thinking_on = (self.enable_thinking
+                                   if self.enable_thinking is not None
+                                   else config.QWEN_ENABLE_THINKING)
                     _kwargs["extra_body"] = {"enable_thinking": thinking_on}
                 if thinking_on:
                     # DashScope 思考模式要求流式；累积 content（忽略 reasoning_content）

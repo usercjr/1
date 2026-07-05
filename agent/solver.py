@@ -224,11 +224,15 @@ class Solver:
         llm: Optional[QwenLLM] = None,
         top_k: int = config.TOP_K_CHUNKS,
         max_chunk_chars: int = config.MAX_CHUNK_CHARS_IN_PROMPT,
+        reasoner: Optional[QwenLLM] = None,
     ):
         self.retriever = retriever
         self.llm = llm or QwenLLM()
         self.top_k = top_k
         self.max_chunk_chars = max_chunk_chars
+        # 题型路由：mcq/tf 的主答题调用走思考模型（计算/推理题实测 17/17 零回归）；
+        # multi 与 复核/文档选择 仍走主模型。None = 不路由。
+        self.reasoner = reasoner
 
     # ---- query 构造 ----
     @staticmethod
@@ -738,9 +742,14 @@ class Solver:
                               doc_roster=roster, doc_ord=doc_ord)
 
         # 3) 调 LLM（逐项分析需要更多 completion token；tf 题简单给少些）
+        #    题型路由：mcq/tf 走思考模型（需给足思考 token），multi 走主模型
         meta = {"qid": qid, "fmt": fmt, "domain": domain, "mode": mode}
+        use_llm = self.llm
         max_tok = 300 if fmt == "tf" else config.MAX_COMPLETION_TOKENS
-        raw = self.llm.chat(prompt, max_tokens=max_tok, meta=meta)
+        if self.reasoner is not None and fmt in ("mcq", "tf"):
+            use_llm = self.reasoner
+            max_tok = config.REASONER_MAX_TOKENS
+        raw = use_llm.chat(prompt, max_tokens=max_tok, meta=meta)
 
         # 4) 答案抽取；抽不到则强制重答一次（学自队友 retry）
         answer = extract_or_none(raw, fmt)

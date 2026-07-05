@@ -199,7 +199,13 @@ def main():
     # 预加载所有索引（global mode 需要；oracle mode 也提前 load 避免循环里 IO 抖动）
     retriever.load_all()
     llm = QwenLLM(model=args.model) if not args.dry_run else None
-    solver = Solver(retriever, llm=llm, top_k=args.top_k) if not args.dry_run else None
+    # 题型路由：QWEN_MODEL_REASONER 非空时，mcq/tf 用思考模型作答
+    reasoner = None
+    if not args.dry_run and config.QWEN_MODEL_REASONER:
+        reasoner = QwenLLM(model=config.QWEN_MODEL_REASONER, enable_thinking=True)
+        log.info(f"题型路由: mcq/tf -> {config.QWEN_MODEL_REASONER} (thinking on)")
+    solver = (Solver(retriever, llm=llm, top_k=args.top_k, reasoner=reasoner)
+              if not args.dry_run else None)
 
     stats = get_token_stats()
 
