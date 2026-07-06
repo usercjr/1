@@ -66,6 +66,48 @@ _FINANCE_TERMS = [
 ]
 
 
+# 选项指纹数字：百分比 / 亿万金额 / 带小数的数 / 6位代码（带单位提取降噪，
+# "63%"和"2500亿"是指纹，裸"63"不是）。匹配前去空格/逗号归一化（"2,500 亿"→"2500亿"）。
+_RE_OPT_NUM = re.compile(r"\d+(?:\.\d+)?%|\d+(?:\.\d+)?[亿万]|\d+\.\d+|(?<!\d)\d{6}(?!\d)")
+
+
+def _num_norm_full(s: str) -> str:
+    """全归一（去空白+逗号）：只用于从选项短文本提取指纹。"""
+    return re.sub(r"[,，\s]", "", s or "")
+
+
+def _num_norm(s: str) -> str:
+    """温和归一（只去数字内千分位逗号）：用于证据/引文的存在性匹配。
+    不能去空白——表格"63.51 65.54 66.38"去空白会连成串破坏数字边界。"""
+    return re.sub(r"(?<=\d)[,，](?=\d)", "", s or "")
+
+
+def _opt_fingerprints(text: str) -> List[str]:
+    return list(dict.fromkeys(_RE_OPT_NUM.findall(_num_norm_full(text))))
+
+
+def _num_pattern(n: str, loose: bool = False) -> "re.Pattern":
+    """指纹数字 → 匹配正则。
+    严格版（缺口检测）：整数带单位的（63% / 2500亿）匹配带小数变体（63.51%），单位必须在。
+    宽松版（引文门槛）：单位可省略——表格引文常是"63.51"而 % 在表头
+    （fc_a_004 曾因此把正确引文拦下）。"""
+    m = re.match(r"^(\d+(?:\.\d+)?)([%亿万])$", n)
+    if m:
+        base, unit = m.group(1), m.group(2)
+        dec = r"(?:\.\d+)?" if "." not in base else ""
+        u = r"\s*" + re.escape(unit) + ("?" if loose else "")
+        return re.compile(r"(?<!\d)" + re.escape(base) + dec + u)
+    if re.match(r"^\d", n):
+        return re.compile(r"(?<!\d)" + re.escape(n))
+    return re.compile(re.escape(n))
+
+
+def _nums_in(nums: List[str], text_norm: str, loose: bool = False) -> int:
+    """归一化文本中命中的指纹数字个数（按变体正则）。"""
+    return sum(1 for n in nums if _num_pattern(n, loose).search(text_norm))
+
+
+
 def _ensure_jieba_dict():
     for w in _FINANCE_TERMS:
         jieba.add_word(w, freq=2_000)

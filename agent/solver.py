@@ -51,46 +51,9 @@ _RECHECK_ENABLED = True
 _RECHECK_MAX_PER_Q = 2          # 单题最多复核选项数（控 token）
 _RECHECK_TOP_K = 3              # 复核时定向补检 chunk 数
 _RECHECK_CHUNK_CHARS = 600
-# 选项指纹数字：百分比 / 亿万金额 / 带小数的数 / 6位代码（带单位提取降噪，
-# "63%"和"2500亿"是指纹，裸"63"不是）。匹配前去空格/逗号归一化（"2,500 亿"→"2500亿"）。
-_RE_OPT_NUM = re.compile(r"\d+(?:\.\d+)?%|\d+(?:\.\d+)?[亿万]|\d+\.\d+|(?<!\d)\d{6}(?!\d)")
-
-
-def _num_norm_full(s: str) -> str:
-    """全归一（去空白+逗号）：只用于从选项短文本提取指纹。"""
-    return re.sub(r"[,，\s]", "", s or "")
-
-
-def _num_norm(s: str) -> str:
-    """温和归一（只去数字内千分位逗号）：用于证据/引文的存在性匹配。
-    不能去空白——表格"63.51 65.54 66.38"去空白会连成串破坏数字边界。"""
-    return re.sub(r"(?<=\d)[,，](?=\d)", "", s or "")
-
-
-def _opt_fingerprints(text: str) -> List[str]:
-    return list(dict.fromkeys(_RE_OPT_NUM.findall(_num_norm_full(text))))
-
-
-def _num_pattern(n: str, loose: bool = False) -> "re.Pattern":
-    """指纹数字 → 匹配正则。
-    严格版（缺口检测）：整数带单位的（63% / 2500亿）匹配带小数变体（63.51%），单位必须在。
-    宽松版（引文门槛）：单位可省略——表格引文常是"63.51"而 % 在表头
-    （fc_a_004 曾因此把正确引文拦下）。"""
-    m = re.match(r"^(\d+(?:\.\d+)?)([%亿万])$", n)
-    if m:
-        base, unit = m.group(1), m.group(2)
-        dec = r"(?:\.\d+)?" if "." not in base else ""
-        u = r"\s*" + re.escape(unit) + ("?" if loose else "")
-        return re.compile(r"(?<!\d)" + re.escape(base) + dec + u)
-    if re.match(r"^\d", n):
-        return re.compile(r"(?<!\d)" + re.escape(n))
-    return re.compile(re.escape(n))
-
-
-def _nums_in(nums: List[str], text_norm: str, loose: bool = False) -> int:
-    """归一化文本中命中的指纹数字个数（按变体正则）。"""
-    return sum(1 for n in nums if _num_pattern(n, loose).search(text_norm))
-
+# 数字指纹工具已下沉至 retriever（锚定位与复核共用同一套逻辑，见 retriever.py）
+from agent.retriever import (_RE_OPT_NUM, _num_norm, _num_norm_full,  # noqa: F401
+                             _opt_fingerprints, _num_pattern, _nums_in)
 
 # 首答分析中的"证据缺口"标志词
 # 注意"未直接提供/没有直接给出/缺乏直接支持"这类插入"直接"的变体（fin 域高频，
@@ -407,6 +370,8 @@ class Solver:
         """给出候选文档身份摘要，让 Qwen 选出回答本题所需的文档（按题目提及顺序）。
         解析失败/选空 → 返回 []（调用方回退到别名命中/BM25 头部）。"""
         query = self.build_query(question)
+        # 选项数字+关键词覆盖度：哪份候选真正含有某选项的数字证据（fc 挑错文档的解药）
+        coverage = self._option_doc_coverage(question, candidates, domain)
         lines = []
         for d in candidates:
             heads = self.retriever.doc_head(domain, d, n=1)
@@ -417,12 +382,15 @@ class Solver:
             top = self.retriever.search(query, domain=domain, doc_ids=[d], top_k=1)
             if top:
                 snip = (top[0].get("text") or "")[:150].replace("\n", " ").strip()
-            lines.append(f"- {d}: {ident}\n  相关片段: {snip}")
+            cov = coverage.get(d)
+            cov_part = f"\n  含选项数字证据: {','.join(cov)}" if cov else ""
+            lines.append(f"- {d}: {ident}\n  相关片段: {snip}{cov_part}")
         opts = question.get("options") or {}
         opt_block = "\n".join(f"{k}. {v}" for k, v in opts.items() if v)
         prompt = (
             "你是金融文档检索助手。下面是候选文档清单（doc_id: 文档身份信息 + 与题目相关的"
-            "内容片段）和一道题目。\n"
+            "内容片段；部分候选标注了\"含选项数字证据\"——该文档内有与某选项的数字和关键词"
+            "同时匹配的段落，是强信号，覆盖选项最全的文档组合优先）和一道题目。\n"
             "请选出回答该题必须阅读的全部文档（通常 1-4 份，宁全勿漏：题目和选项涉及的每个"
             "主体/产品/法规/报告都要选到；对比类题目须选入所有被对比的文档）。"
             "若题目用\"第一份文档/第二份文档\"等序数指代，请按题意顺序排列输出。\n\n"
@@ -442,6 +410,54 @@ class Solver:
         picked = re.findall(r'"([^"]+)"', m.group(1))
         cand_set = set(candidates)
         return [d for d in picked if d in cand_set][:_DOC_SELECT_MAX_PICK]
+
+    # ---- 选项→候选文档 覆盖度（0 token，供文档选择步参考）----
+    def _option_doc_coverage(
+        self,
+        question: Dict[str, Any],
+        candidates: List[str],
+        domain: Optional[str],
+    ) -> Dict[str, List[str]]:
+        """返回 {doc_id: [覆盖的选项字母]}：候选文档中存在某 chunk 同时含
+        选项指纹数字（变体匹配）与选项关键词 → 该文档"覆盖"该选项。
+        动机：fc 盲测文档挑错（fc_a_016 选了 text11 而非 text09）——整数百分比
+        在募集说明书表格里遍地是，判别力在 数字+关键词（转股价/资产负债率）共现。"""
+        if not domain or not candidates:
+            return {}
+        opts = question.get("options") or {}
+        import jieba as _jieba
+        _STOP = {"文档", "第一份", "第二份", "第三份", "第四份"}
+        sigs = {}
+        for k, v in opts.items():
+            nums = _opt_fingerprints(v or "")
+            if not nums:
+                continue
+            kws = [w for w in _jieba.lcut(v or "")
+                   if len(w) >= 3 and not re.search(r"\d", w) and w not in _STOP]
+            sigs[k] = ([(n, _num_pattern(n)) for n in nums], kws)
+        if not sigs:
+            return {}
+        cand_set = set(candidates)
+        cover: Dict[str, set] = {}
+        try:
+            idx = self.retriever._load(domain)
+        except FileNotFoundError:
+            return {}
+        for c in idx["chunks"]:
+            d = c.get("doc_id")
+            if d not in cand_set:
+                continue
+            raw_t = c.get("text") or ""
+            t = _num_norm(raw_t)
+            for k, (pats, kws) in sigs.items():
+                if k in cover.get(d, set()):
+                    continue
+                if not any(p.search(t) for _n, p in pats):
+                    continue
+                if kws and not any(w in raw_t for w in kws):
+                    continue
+                cover.setdefault(d, set()).add(k)
+        return {d: sorted(v) for d, v in cover.items()}
 
     # ---- 文档对照表（多文档题序数指代）----
     def _doc_roster(self, ids: Optional[List[str]], domain) -> Tuple[str, Dict[str, int]]:
@@ -732,6 +748,27 @@ class Solver:
                 "section": f"【选项{k}相关】" + (g.get("section") or ""),
             })
             kept_ids.add(g["chunk_id"])
+
+        # 1.65) "均有型"选项 per-doc 保底："两份文档均提及违约条款"这类选项需要
+        #        每份文档各有证据才能判真，全局 top-1 保底不够（fc_a_009-D 型漏选）。
+        opts_all = question.get("options") or {}
+        if fmt == "multi" and trusted_ids and 2 <= len(trusted_ids) <= 4:
+            for k, v in opts_all.items():
+                if not v or not re.search(r"均|都[提有含披]|各自|两份文档", v):
+                    continue
+                for d in trusted_ids[:3]:
+                    top = self.retriever.search(
+                        f"{question.get('question','')} {v}",
+                        domain=search_domain, doc_ids=[d], top_k=1)
+                    for g in top:
+                        if g["chunk_id"] in kept_ids:
+                            continue
+                        hits.append({
+                            **g,
+                            "text": (g.get("text") or "")[:_GUARD_CHARS],
+                            "section": f"【选项{k}·{d}】" + (g.get("section") or ""),
+                        })
+                        kept_ids.add(g["chunk_id"])
 
         # 1.7) 多文档题：文档对照表 + 证据按"第 N 份文档"标注
         #      oracle 用题目 doc_ids 顺序；blind 用别名题面首现顺序（≥2 个才建）
