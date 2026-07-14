@@ -59,3 +59,7 @@ QWEN_ENABLE_THINKING: bool = (_get("QWEN_THINKING", "") or "") in ("1", "true", 
 # multi 仍走主模型+机制围栏（fc-D 型数字复核是其强项）。空 = 不启用路由。
 QWEN_MODEL_REASONER: str = _get("QWEN_MODEL_REASONER", "") or ""
 REASONER_MAX_TOKENS: int = int(_get("REASONER_MAX_TOKENS", "6000") or 6000)
+# 路由稳定化：思考模型采样两次，一致即采纳（保住计算死题修复），
+# 不一致回落主模型（拦思考模型自身方差）。历史 4 个分歧案例仲裁 4/4 正确。
+# 代价 mcq/tf 每题 +1 次思考调用（B 榜 100 题约 +250K token）。
+REASONER_VOTE: bool = (_get("REASONER_VOTE", "") or "") in ("1", "true", "True")

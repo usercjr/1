@@ -800,6 +800,25 @@ class Solver:
             max_tok = config.REASONER_MAX_TOKENS
         raw = use_llm.chat(prompt, max_tokens=max_tok, meta=meta)
 
+        # 3.5) 路由稳定化（REASONER_VOTE=1）：思考模型再采样一次，
+        #      一致→采纳（保计算死题修复）；不一致→回落主模型答案（拦思考自身方差）。
+        #      历史分歧案例（ins_a_001/fin_a_015/ins_a_006/ins_a_020）仲裁 4/4 正确。
+        if (config.REASONER_VOTE and self.reasoner is not None
+                and fmt in ("mcq", "tf")):
+            a1 = extract_or_none(raw, fmt)
+            raw2 = self.reasoner.chat(prompt, max_tokens=max_tok,
+                                      meta={**meta, "vote": 2})
+            a2 = extract_or_none(raw2, fmt)
+            if a1 is not None and a1 == a2:
+                pass  # 两次思考一致，采纳 raw
+            else:
+                raw_max = self.llm.chat(prompt, max_tokens=(
+                    300 if fmt == "tf" else config.MAX_COMPLETION_TOKENS),
+                    meta={**meta, "vote": "fallback"})
+                a3 = extract_or_none(raw_max, fmt)
+                if a3 is not None:
+                    raw = raw_max + f"\n[vote] think1={a1} think2={a2} -> qwen-max 仲裁"
+
         # 4) 答案抽取；抽不到则强制重答一次（学自队友 retry）
         answer = extract_or_none(raw, fmt)
         if answer is None:
