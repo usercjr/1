@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent import config
 from agent.llm import QwenLLM
 from agent.postproc import normalize, extract_or_none
-from agent.prompts import build_prompt
+from agent.prompts import build_prompt, render_evidence
 from agent.retriever import Retriever
 
 log = logging.getLogger(__name__)
@@ -188,6 +188,7 @@ class Solver:
         top_k: int = config.TOP_K_CHUNKS,
         max_chunk_chars: int = config.MAX_CHUNK_CHARS_IN_PROMPT,
         reasoner: Optional[QwenLLM] = None,
+        multi2: Optional[QwenLLM] = None,
     ):
         self.retriever = retriever
         self.llm = llm or QwenLLM()
@@ -196,6 +197,8 @@ class Solver:
         # 题型路由：mcq/tf 的主答题调用走思考模型（计算/推理题实测 17/17 零回归）；
         # multi 与 复核/文档选择 仍走主模型。None = 不路由。
         self.reasoner = reasoner
+        # 多选双模型仲裁：第二模型同答 multi，分歧字母对质裁决。None = 不启用。
+        self.multi2 = multi2
 
     # ---- query 构造 ----
     @staticmethod
@@ -561,6 +564,63 @@ class Solver:
             })
         return out
 
+    # ---- 多选双模型分歧仲裁 ----
+    def _arbitrate_multi(
+        self,
+        question: Dict[str, Any],
+        hits: List[Dict[str, Any]],
+        roster: str,
+        doc_ord: Dict[str, int],
+        raw_a: str,
+        raw_b: str,
+        a_a: str,
+        a_b: str,
+        meta: Dict[str, Any],
+    ) -> Tuple[Optional[str], str]:
+        """两模型多选答案不一致时，对分歧字母做一次对质裁决：
+        共同选的保留、共同不选的排除，仅裁决对称差字母。返回 (最终答案, 日志)。"""
+        common = set(a_a) & set(a_b)
+        disputed = sorted(set(a_a) ^ set(a_b))
+        opts = question.get("options") or {}
+        an_a = self._parse_analysis(raw_a)
+        an_b = self._parse_analysis(raw_b)
+        evidence = render_evidence(hits, max_chars=self.max_chunk_chars, doc_ord=doc_ord)
+        if roster:
+            evidence = roster + "\n\n" + evidence
+        blocks = []
+        for k in disputed:
+            side_in = an_a.get(k, "") if k in a_a else an_b.get(k, "")
+            side_out = an_b.get(k, "") if k in a_a else an_a.get(k, "")
+            blocks.append(
+                f"选项{k}: {opts.get(k, '')}\n"
+                f"  选入方理由: {side_in[:200]}\n"
+                f"  排除方理由: {side_out[:200]}"
+            )
+        arb_prompt = (
+            "两位分析师对下面多选题的部分选项判断不一致。请你作为最终裁决人，"
+            "严格依据证据逐个裁决分歧选项是否成立。\n"
+            "裁决标准（从严）：证据明确、直接支持选项具体断言（数字/日期/主体/口径相符）"
+            "才为 true；证据未提及、仅间接沾边、科目口径不符 → false。\n\n"
+            f"【证据】\n{evidence}\n\n"
+            f"【题目】{question.get('question', '')}\n\n"
+            "【分歧选项】\n" + "\n".join(blocks) + "\n\n"
+            '只输出一行 JSON，对每个分歧选项给出布尔判定，如 {"B":true,"D":false}'
+        )
+        try:
+            out = self.llm.chat(arb_prompt, max_tokens=200,
+                                meta={**meta, "arbitrate": "".join(disputed)})
+        except Exception as e:
+            log.warning(f"[{meta.get('qid')}] 仲裁调用失败: {e}")
+            return None, f"仲裁失败:{e}"
+        final = set(common)
+        for k in disputed:
+            m = re.search(r'"%s"\s*:\s*(true|false)' % k, out or "", re.I)
+            if m and m.group(1).lower() == "true":
+                final.add(k)
+        if not final:  # 裁决后为空 → 回退模型甲
+            return None, "裁决为空回退 | " + (out or "")[:120]
+        return "".join(sorted(final)), (out or "").strip()[:200]
+
     # ---- 多选证据缺口复核 ----
     def _recheck_gap_options(
         self,
@@ -819,6 +879,21 @@ class Solver:
                 if a3 is not None:
                     raw = raw_max + f"\n[vote] think1={a1} think2={a2} -> qwen-max 仲裁"
 
+        # 3.6) 多选双模型仲裁：第二模型（错误方向互补）同答；一致采纳，
+        #      分歧字母走一次对质裁决（共同选的保留、共同不选的排除）。
+        arb_answer: Optional[str] = None
+        if self.multi2 is not None and fmt == "multi":
+            raw_b = self.multi2.chat(prompt, max_tokens=config.MAX_COMPLETION_TOKENS,
+                                     meta={**meta, "multi2": True})
+            a_a = extract_or_none(raw, fmt)
+            a_b = extract_or_none(raw_b, fmt)
+            if a_a and a_b and a_a != a_b:
+                arb_answer, arb_log = self._arbitrate_multi(
+                    question, hits, roster, doc_ord, raw, raw_b, a_a, a_b, meta)
+                raw = raw + f"\n[multi2 {self.multi2.model}={a_b} 仲裁={arb_answer}] " + arb_log
+            elif a_a and a_b:
+                raw = raw + f"\n[multi2 {self.multi2.model}={a_b} 一致]"
+
         # 4) 答案抽取；抽不到则强制重答一次（学自队友 retry）
         answer = extract_or_none(raw, fmt)
         if answer is None:
@@ -833,6 +908,8 @@ class Solver:
                 raw = raw + "\n[retry] " + raw_retry
         if answer is None:
             answer = normalize(raw, fmt)  # 最终合法兜底
+        if arb_answer:
+            answer = arb_answer  # 双模型仲裁结果优先
 
         # 5) 多选"证据缺口复核"：首答里明说"证据未提及/未找到"的未选选项，
         #    很可能是证据没检索到而非选项为假 → 定向补检 + 小额验证，支持则补入。

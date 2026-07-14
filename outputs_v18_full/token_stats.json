@@ -1,0 +1,22 @@
+{
+  "prompt_tokens": 579602,
+  "completion_tokens": 53905,
+  "total_tokens": 633507,
+  "calls": 118,
+  "by_model": {
+    "qwen-max": {
+      "calls": 83,
+      "prompt": 405981,
+      "completion": 12551,
+      "total": 418532
+    },
+    "qwen3.7-plus": {
+      "calls": 35,
+      "prompt": 173621,
+      "completion": 41354,
+      "total": 214975
+    }
+  },
+  "n_questions_solved": 100,
+  "n_errors": 0
+}

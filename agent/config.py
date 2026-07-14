@@ -63,3 +63,8 @@ REASONER_MAX_TOKENS: int = int(_get("REASONER_MAX_TOKENS", "6000") or 6000)
 # 不一致回落主模型（拦思考模型自身方差）。历史 4 个分歧案例仲裁 4/4 正确。
 # 代价 mcq/tf 每题 +1 次思考调用（B 榜 100 题约 +250K token）。
 REASONER_VOTE: bool = (_get("REASONER_VOTE", "") or "") in ("1", "true", "True")
+
+# 多选双模型仲裁：第二模型（qwen3.7-max，与 qwen-max 错误方向互补——
+# 37max 修方差题但偏保守漏 D，qwen-max 反之）同答 multi；一致即采纳，
+# 分歧字母走一次"对质裁决"调用。空 = 不启用。
+QWEN_MODEL_MULTI2: str = _get("QWEN_MODEL_MULTI2", "") or ""

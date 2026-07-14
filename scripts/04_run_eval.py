@@ -204,7 +204,11 @@ def main():
     if not args.dry_run and config.QWEN_MODEL_REASONER:
         reasoner = QwenLLM(model=config.QWEN_MODEL_REASONER, enable_thinking=True)
         log.info(f"题型路由: mcq/tf -> {config.QWEN_MODEL_REASONER} (thinking on)")
-    solver = (Solver(retriever, llm=llm, top_k=args.top_k, reasoner=reasoner)
+    multi2 = None
+    if not args.dry_run and config.QWEN_MODEL_MULTI2:
+        multi2 = QwenLLM(model=config.QWEN_MODEL_MULTI2)
+        log.info(f"多选双模型仲裁: multi 第二模型 -> {config.QWEN_MODEL_MULTI2}")
+    solver = (Solver(retriever, llm=llm, top_k=args.top_k, reasoner=reasoner, multi2=multi2)
               if not args.dry_run else None)
 
     stats = get_token_stats()
