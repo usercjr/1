@@ -326,6 +326,11 @@ class Solver:
                 if _clause_score(best, kw, prox) < _INS_PIN_MIN_SCORE:
                     continue  # 只有交叉引用/弱相关块，宁缺毋滥
                 if best["chunk_id"] in existing:
+                    for h in hits:  # 已召回的低分版本提分到钉入级，防被预算挤掉
+                        if h["chunk_id"] == best["chunk_id"] and h.get("score", 0) < _FIN_PIN_SCORE:
+                            h["score"] = _FIN_PIN_SCORE
+                            h["section"] = f"【条款·{kw}】" + (h.get("section") or "")
+                            break
                     continue
                 pins.append({
                     "chunk_id": best["chunk_id"], "doc_id": best["doc_id"], "domain": domain,
@@ -339,7 +344,10 @@ class Solver:
 
     # ---- 钉入公共实现 ----
     def _apply_pins(self, hits, doc_ids, domain, wants, tag, max_pins=99):
-        existing = {h["chunk_id"] for h in hits}
+        # 注意：目标 chunk 已被 BM25 召回时不能只是跳过——低分版本会被预算挤掉，
+        # 钉入的"保送"承诺失效（fin_a_007 盲测 byd_2024 主表因此丢失）→ 提分到钉入级
+        by_id = {h["chunk_id"]: h for h in hits}
+        existing = set(by_id)
         pins: List[Dict[str, Any]] = []
         for d in doc_ids:
             for pred, n, label, cap in wants:
@@ -347,6 +355,10 @@ class Solver:
                     break
                 for c in self.retriever.find_doc_chunks(domain, d, pred, n=n):
                     if c["chunk_id"] in existing:
+                        h = by_id.get(c["chunk_id"])
+                        if h is not None and h.get("score", 0) < _FIN_PIN_SCORE:
+                            h["score"] = _FIN_PIN_SCORE
+                            h["section"] = f"【{tag}·{label}】" + (h.get("section") or "")
                         continue
                     text = c.get("text") or ""
                     pins.append({
