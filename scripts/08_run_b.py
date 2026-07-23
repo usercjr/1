@@ -121,9 +121,12 @@ def _norm_number(s: str, hint: str) -> str:
         val = float(num)
     except ValueError:
         return (s or "").strip()
-    if pct or is_pct_hint:
+    # 以官方占位为准：占位带% → 带%；占位纯数字 → 去%（fin_b_013 题面"不带单位"）
+    if is_pct_hint:
         return f"{val:.2f}%"
-    return f"{val:.2f}"
+    if hint and not is_pct_hint:
+        return f"{val:.2f}"
+    return f"{val:.2f}%" if pct else f"{val:.2f}"
 
 
 def parse_calc(raw: str, slots: List[str]) -> (List[str], str):
@@ -297,6 +300,11 @@ def main():
 
     order = [q["qid"] for q in questions]
     records = [done[qid] for qid in order if qid in done]
+    for rec in records:  # 计算题答案按最新规范化规则重过一遍（幂等）
+        if rec.get("type") in ("计算题", "抽取题"):
+            slots = template.get(rec["qid"], [""])
+            rec["answers"] = [_norm_number(a, slots[i] if i < len(slots) else "")
+                              for i, a in enumerate(rec["answers"])]
     write_csv(records, out_dir / "submit_b.csv")
     (out_dir / "token_stats.json").write_text(
         json.dumps(stats.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
